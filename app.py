@@ -52,7 +52,15 @@ def get_video_id(url: str) -> Optional[str]:
         match = re.search(pattern, url)
         if match:
             return match.group(1)
-    return None    
+    return None 
+
+
+def require_video_id(video_url: str) -> str:
+    """Return video id or raise a validation error."""
+    video_id = get_video_id(video_url)
+    if not video_id:
+        raise ValueError("Invalid YouTube URL.")
+    return video_id
 
 
 def download_audio(video_url: str, output_dir: Path) -> Path:
@@ -78,7 +86,7 @@ video_url = "https://www.youtube.com/watch?v=BSuAgw8Lc1Y"
 source_dir = Path("./cache/yt_dlp_cache")
 wav_path = Path("./cache/audio_cache/audio.wav")
 
-video_id = get_video_id(video_url)
+video_id = require_video_id(video_url)
 source_audio = download_audio(video_id, source_dir)
 convert_to_wav_16k_mono(source_audio, wav_path)
 

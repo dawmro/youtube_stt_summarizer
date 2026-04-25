@@ -36,6 +36,7 @@ def remove_matching_files(directory: Path, prefix: str) -> None:
         if path.name.startswith(prefix):
             try:
                 path.unlink()
+                logger.info("Stale files deleted: %s", path)
             except FileNotFoundError:
                 pass
 
@@ -44,6 +45,11 @@ def seconds_to_hhmmss(seconds: float) -> str:
     """Convert floating-point seconds to HH:MM:SS."""
     total = max(0, int(seconds))
     return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}"
+
+
+def build_youtube_time_url(video_id: str, start_seconds: float) -> str:
+    """Build a YouTube watch URL with a stable start timestamp."""
+    return f"https://www.youtube.com/watch?v={video_id}&t={max(0, int(start_seconds))}s"
 
 
 @lru_cache(maxsize=128)
@@ -66,6 +72,7 @@ def require_video_id(video_url: str) -> str:
     video_id = get_video_id(video_url)
     if not video_id:
         raise ValueError("Invalid YouTube URL.")
+    logger.info("Video id found: %s", video_id)
     return video_id
 
 
@@ -110,6 +117,5 @@ wav_path = Path("./cache/audio_cache/audio.wav")
 video_id = require_video_id(video_url)
 source_audio = download_audio(video_id, source_dir)
 convert_to_wav_16k_mono(source_audio, wav_path)
-
-print(seconds_to_hhmmss(3690))
+logger.info(build_youtube_time_url(video_id, 245))
 

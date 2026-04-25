@@ -1,7 +1,9 @@
-import logging, os
+import logging
+import os
+import re
 import subprocess
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 
 logging.basicConfig(
@@ -36,7 +38,21 @@ def remove_matching_files(directory: Path, prefix: str) -> None:
             except FileNotFoundError:
                 pass
 
-    
+
+def get_video_id(url: str) -> Optional[str]:
+    """Extract a YouTube video id from common URL shapes."""
+    patterns = [
+        r"v=([a-zA-Z0-9_-]{11})",
+        r"youtu\.be/([a-zA-Z0-9_-]{11})",
+        r"shorts/([a-zA-Z0-9_-]{11})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None    
+
+
 def download_audio(video_url: str, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     remove_matching_files(output_dir, "source.")
@@ -56,10 +72,11 @@ def convert_to_wav_16k_mono(input_audio: Path, output_wav: Path) -> Path:
     ])
     return output_wav
 
-video_id = "BSuAgw8Lc1Y"
+video_url = "https://www.youtube.com/watch?v=BSuAgw8Lc1Y"
 source_dir = Path("./cache/yt_dlp_cache")
 wav_path = Path("./cache/audio_cache/audio.wav")
 
+video_id = get_video_id(video_url)
 source_audio = download_audio(video_id, source_dir)
 convert_to_wav_16k_mono(source_audio, wav_path)
 

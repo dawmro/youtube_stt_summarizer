@@ -1,6 +1,8 @@
 import logging, os
 import subprocess
+from pathlib import Path
 from typing import List
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,5 +24,14 @@ def run_command(cmd: List[str]) -> None:
             f"Command failed:\nSTDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
         )
     
+def download_audio(video_url: str, output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_template = str(output_dir / "source.%(ext)s")
+    run_command(["yt-dlp", "-f", "bestaudio/best", "-o", out_template, video_url])
+    candidates = sorted(output_dir.glob("source.*"), key=lambda p: p.stat().st_mtime)
+    if not candidates:
+        raise FileNotFoundError("yt-dlp did not produce an audio file.")
+    return candidates[-1]
 
-run_command(["ffmpeg"])
+download_audio("BSuAgw8Lc1Y", Path("./cache/yt_dlp_cache"))
+

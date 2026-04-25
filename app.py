@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional
 
@@ -39,6 +40,7 @@ def remove_matching_files(directory: Path, prefix: str) -> None:
                 pass
 
 
+@lru_cache(maxsize=128)
 def get_video_id(url: str) -> Optional[str]:
     """Extract a YouTube video id from common URL shapes."""
     patterns = [

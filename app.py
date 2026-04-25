@@ -48,5 +48,18 @@ def download_audio(video_url: str, output_dir: Path) -> Path:
     return candidates[-1]
 
 
-download_audio("BSuAgw8Lc1Y", Path("./cache/yt_dlp_cache"))
+def convert_to_wav_16k_mono(input_audio: Path, output_wav: Path) -> Path:
+    output_wav.parent.mkdir(parents=True, exist_ok=True)
+    run_command([
+        "ffmpeg", "-y", "-i", str(input_audio),
+        "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(output_wav),
+    ])
+    return output_wav
+
+video_id = "BSuAgw8Lc1Y"
+source_dir = Path("./cache/yt_dlp_cache")
+wav_path = Path("./cache/audio_cache/audio.wav")
+
+source_audio = download_audio(video_id, source_dir)
+convert_to_wav_16k_mono(source_audio, wav_path)
 

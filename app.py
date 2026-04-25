@@ -24,14 +24,29 @@ def run_command(cmd: List[str]) -> None:
             f"Command failed:\nSTDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}"
         )
     
+
+def remove_matching_files(directory: Path, prefix: str) -> None:
+    """Delete stale files that share the same prefix inside a cache folder."""
+    if not directory.exists():
+        return
+    for path in directory.iterdir():
+        if path.name.startswith(prefix):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    
 def download_audio(video_url: str, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
+    remove_matching_files(output_dir, "source.")
     out_template = str(output_dir / "source.%(ext)s")
     run_command(["yt-dlp", "-f", "bestaudio/best", "-o", out_template, video_url])
     candidates = sorted(output_dir.glob("source.*"), key=lambda p: p.stat().st_mtime)
     if not candidates:
         raise FileNotFoundError("yt-dlp did not produce an audio file.")
     return candidates[-1]
+
 
 download_audio("BSuAgw8Lc1Y", Path("./cache/yt_dlp_cache"))
 

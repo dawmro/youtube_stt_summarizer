@@ -40,6 +40,12 @@ def remove_matching_files(directory: Path, prefix: str) -> None:
                 pass
 
 
+def seconds_to_hhmmss(seconds: float) -> str:
+    """Convert floating-point seconds to HH:MM:SS."""
+    total = max(0, int(seconds))
+    return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}"
+
+
 @lru_cache(maxsize=128)
 def get_video_id(url: str) -> Optional[str]:
     """Extract a YouTube video id from common URL shapes."""
@@ -64,10 +70,17 @@ def require_video_id(video_url: str) -> str:
 
 
 def download_audio(video_url: str, output_dir: Path) -> Path:
+    """Download source audio using yt-dlp.
+
+    Business logic:
+    keep the source download separate from ffmpeg normalization so failures are
+    easier to reason about and retry.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     remove_matching_files(output_dir, "source.")
     out_template = str(output_dir / "source.%(ext)s")
     run_command(["yt-dlp", "-f", "bestaudio/best", "-o", out_template, video_url])
+
     candidates = sorted(output_dir.glob("source.*"), key=lambda p: p.stat().st_mtime)
     if not candidates:
         raise FileNotFoundError("yt-dlp did not produce an audio file.")
@@ -75,11 +88,19 @@ def download_audio(video_url: str, output_dir: Path) -> Path:
 
 
 def convert_to_wav_16k_mono(input_audio: Path, output_wav: Path) -> Path:
+    """Normalize audio into 16kHz mono WAV for local Whisper inference."""
     output_wav.parent.mkdir(parents=True, exist_ok=True)
-    run_command([
-        "ffmpeg", "-y", "-i", str(input_audio),
-        "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(output_wav),
-    ])
+    run_command(
+        [
+            "ffmpeg",
+            "-y",
+            "-i", str(input_audio),
+            "-ar", "16000",
+            "-ac", "1",
+            "-c:a", "pcm_s16le",
+            str(output_wav),
+        ]
+    )
     return output_wav
 
 video_url = "https://www.youtube.com/watch?v=BSuAgw8Lc1Y"
@@ -89,4 +110,6 @@ wav_path = Path("./cache/audio_cache/audio.wav")
 video_id = require_video_id(video_url)
 source_audio = download_audio(video_id, source_dir)
 convert_to_wav_16k_mono(source_audio, wav_path)
+
+print(seconds_to_hhmmss(3690))
 

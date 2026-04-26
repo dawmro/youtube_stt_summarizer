@@ -30,6 +30,7 @@ import tiktoken
 from faster_whisper import WhisperModel
 from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_community.llms import Ollama
 
@@ -686,33 +687,48 @@ def load_cached_transcript(
 
 # =============================================================================
 # TYPED GENERATOR YIELDS
-# ============================================================================
+# =============================================================================
 
 class SummaryUpdate(NamedTuple):
-    """Streaming update yielded by summarize_transcript_stream.
-
-    Fields:
-        message  — human-readable status line shown in the UI status label.
-        summary  — the finished summary text, or None while still generating.
-        progress — integer 0-100 for the progress bar.
-    """
+    """Streaming update yielded by summarize_transcript_stream."""
     message: str
     summary: Optional[str]
     progress: int
-
 
 # =============================================================================
 # SUMMARIZATION PIPELINE
 # =============================================================================
 
+def chunk_transcript_for_summary(text: str) -> List[str]:
+    """Split transcript text into token-aware chunks for long-input summarization.
+
+    Uses RecursiveCharacterTextSplitter with a token-based length function so
+    each chunk stays within CFG.summary_target_tokens.  The overlap ensures
+    sentences that fall near a boundary are not lost between chunks.
+    """
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CFG.summary_target_tokens,
+        chunk_overlap=CFG.summary_chunk_overlap_tokens,
+        separators=["\n\n", "\n", " ", ""],
+        length_function=estimate_tokens,
+    )
+    return splitter.split_text(text)
+
+
 def summarize_transcript_stream(
     text: str,
     runtime: RuntimeDeps,
 ) -> Generator[SummaryUpdate, None, None]:
-    """Summarize a transcript, yielding typed status updates for the UI.
+    """Summarize transcript directly or through iterative hierarchical reduction.
 
-    For transcripts that fit within the model context window the full text is
-    sent to the LLM in a single call (direct mode).  
+    Short transcripts (≤ max_transcript_tokens) are sent to the LLM in one
+    call.  Longer transcripts are split into chunks, each chunk summarised
+    individually, then the chunk summaries are merged.  If the merged text is
+    still too long the loop runs again, up to CFG.max_summary_passes times.
+
+    Strategy selection:
+        direct  — transcript fits in one context window.
+        chunked — one or more reduction passes required.
     """
     if estimate_tokens(text) <= CFG.max_transcript_tokens:
         yield SummaryUpdate("📝 Generating direct summary...", None, 30)
@@ -723,10 +739,67 @@ def summarize_transcript_stream(
         yield SummaryUpdate("✅ Final summary ready.", summary, 100)
         return
 
-    # Transcripts longer than the context window are not yet supported.
+    # ---- Hierarchical multi-pass reduction ----
+    current_text = text
+    for pass_idx in range(1, CFG.max_summary_passes + 1):
+        chunks = chunk_transcript_for_summary(current_text)
+        yield SummaryUpdate(
+            f"🧩 Summary pass {pass_idx}: split into {len(chunks)} chunks...",
+            None,
+            10,
+        )
+
+        chunk_summaries: List[str] = []
+        total = len(chunks)
+        for idx, chunk in enumerate(chunks, start=1):
+            progress = min(80, 10 + int(70 * idx / total))
+            yield SummaryUpdate(
+                f"📝 Summarizing chunk {idx}/{total}...", None, progress
+            )
+            with log_time(f"chunk summary {pass_idx}:{idx}/{total}"):
+                chunk_summary = runtime.chunk_summary_chain.predict(
+                    chunk=chunk
+                ).strip()
+            if not chunk_summary:
+                raise RuntimeError(
+                    f"Chunk summary {idx} returned empty output."
+                )
+            chunk_summaries.append(chunk_summary)
+
+        merged = "\n\n".join(chunk_summaries)
+        merged_tokens = estimate_tokens(merged)
+        logger.info(
+            "Summary pass %d produced %d tokens", pass_idx, merged_tokens
+        )
+
+        if merged_tokens <= CFG.max_transcript_tokens:
+            yield SummaryUpdate(
+                "📌 Generating final summary from merged chunk summaries...",
+                None,
+                90,
+            )
+            with log_time("final merged summary generation"):
+                final_summary = runtime.reduce_summary_chain.predict(
+                    summaries=merged
+                ).strip()
+            if not final_summary:
+                raise RuntimeError(
+                    "Final summary generation returned empty output."
+                )
+            yield SummaryUpdate("✅ Final summary ready.", final_summary, 100)
+            return
+
+        yield SummaryUpdate(
+            f"⚠️ Intermediate summary still too long "
+            f"({merged_tokens} tokens). Re-summarizing...",
+            None,
+            85,
+        )
+        current_text = merged
+
     raise RuntimeError(
-        f"Transcript is too long ({estimate_tokens(text)} tokens) for direct "
-        "summarization. Chunked support coming soon."
+        "Hierarchical summarization exceeded the maximum number of "
+        "reduction passes."
     )
 
 

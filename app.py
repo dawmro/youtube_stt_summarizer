@@ -588,7 +588,7 @@ def load_cached_transcript(
     data = read_json(transcript_record_path(video_id))
     if not data:
         return None
-    if data.get("stt_config_hash") != STT_CONFIG_HASH:          # ← ADD
+    if data.get("stt_config_hash") != STT_CONFIG_HASH:
         logger.info("Transcript cache STT config hash mismatch — discarding.")
         return None
     transcript = str(data.get("transcript", "")).strip()
@@ -973,11 +973,14 @@ def save_summary(
 def load_cached_summary(
     video_id: str, transcript_hash_value: str, mode: str
 ) -> Optional[str]:
-    """Load summary cache when the summary config hash and transcript hash match."""
+    """Load summary cache when the summary config hash and transcript hash match.
+
+    Returns the summary string or None on a cache miss or config mismatch.
+    """
     data = read_json(summary_record_path(video_id, transcript_hash_value, mode))
     if not data:
         return None
-    if data.get("summary_config_hash") != SUMMARY_CONFIG_HASH:  # ← ADD
+    if data.get("summary_config_hash") != SUMMARY_CONFIG_HASH:
         logger.info("Summary cache config hash mismatch — discarding.")
         return None
     summary = str(data.get("summary", "")).strip()
@@ -1574,160 +1577,279 @@ def render_clickable_answer(
 # GRADIO HANDLERS
 # =============================================================================
 
-def summarize_video_gradio(
-    video_url: str,
-    state_payload: Dict[str, Any],
-) -> Generator:
-    """Run transcript + summary pipeline and stream UI updates.
+def _make_summarize_handler(runtime: RuntimeDeps):
+    """Factory returning summarize_video_gradio closed over runtime.
 
-    References the module-level RUNTIME directly. Yields 8-tuple on each step:
-        (status, token_info, transcript, summary, stats,
-         stt_progress, summary_progress, state)
+    Moving the runtime dependency into a closure instead of referencing a
+    module-level singleton means the module can be imported in tests without
+    triggering Whisper and Ollama initialisation.
     """
-    state = SessionState.from_gradio(state_payload)
-    started_at = time.perf_counter()
+    def summarize_video_gradio(
+        video_url: str,
+        state_payload: Dict[str, Any],
+    ) -> Generator:
+        """Run transcript + summary pipeline and stream UI updates.
 
-    if not video_url.strip():
-        yield ("❌ Please provide a valid YouTube URL.", "", "", "", "", 0, 0, state.to_gradio())
-        return
+        Drives the full transcript → summary pipeline, updating seven Gradio
+        outputs at each yield step:
+            (status, token_info, transcript, summary, stats,
+             stt_progress, summary_progress, state)
+        """
+        state = SessionState.from_gradio(state_payload)
+        started_at = time.perf_counter()
 
-    try:
-        transcript: Optional[str] = None
-        segments: Optional[List[TranscriptSegment]] = None
-        stt_progress = 0
-        summary_progress = 0
-
-        yield "🚀 Starting pipeline...", "", "", "", "", 0, 0, state.to_gradio()
-
-        for update in fetch_transcript_from_stt_stream(video_url, RUNTIME):
-            stt_progress = update.progress
-            transcript = update.transcript or transcript
-            segments = update.segments or segments
-            yield (update.message, "", transcript or "", "", "", stt_progress, summary_progress, state.to_gradio())
-
-        if not transcript or not segments:
-            raise RuntimeError("Transcript fetch failed — no text or segments.")
-
-        state.set_transcript(video_url, transcript, segments)
-        token_count = estimate_tokens(state.processed_transcript)
-        mode = "direct" if token_count <= CFG.max_transcript_tokens else "chunked"
-        token_info = f"{token_count} tokens (limit ~{CFG.max_transcript_tokens}) | mode={mode}"
-        stats_info = (
-            f"chars={len(state.processed_transcript)} "
-            f"| tokens={token_count} | segments={len(state.transcript_segments)}"
-        )
-        summary_progress = 5
-        yield ("🔢 Counting tokens...", token_info, state.processed_transcript, "", stats_info,
-               stt_progress, summary_progress, state.to_gradio())
-
-        cached_summary = load_cached_summary(state.video_id, state.transcript_hash, mode)
-        if cached_summary:
-            state.summary = cached_summary
-            elapsed = time.perf_counter() - started_at
-            yield (f"✅ Done in {elapsed:.2f}s (cached summary).", token_info,
-                   state.processed_transcript, state.summary, stats_info, 100, 100, state.to_gradio())
+        if not video_url.strip():
+            yield (
+                "❌ Please provide a valid YouTube URL.",
+                "", "", "", "", 0, 0, state.to_gradio(),
+            )
             return
 
-        for update in summarize_transcript_stream(state.processed_transcript, RUNTIME):
-            summary_progress = update.progress
-            if update.summary:
-                state.summary = update.summary
-            yield (update.message, token_info, state.processed_transcript, state.summary,
-                   stats_info, stt_progress, summary_progress, state.to_gradio())
-
-        if not state.summary:
-            raise RuntimeError("Summary generation returned empty output.")
-
-        save_summary(state.video_id, state.transcript_hash, mode, state.summary)
-        elapsed = time.perf_counter() - started_at
-        yield (f"✅ Done in {elapsed:.2f}s.", token_info, state.processed_transcript,
-               state.summary, stats_info, 100, 100, state.to_gradio())
-
-    except Exception as exc:
-        logger.exception("Summarize pipeline error")
-        yield (f"❌ Error: {exc}", "", "", "", "", 0, 0, state.to_gradio())
-
-
-def answer_question_gradio(
-    video_url: str,
-    user_question: str,
-    state_payload: Dict[str, Any],
-) -> Generator:
-    """Run timestamp-aware Q&A and stream UI updates.
-
-    References the module-level RUNTIME directly. Yields 4-tuple:
-        (status, answer, progress, state)
-    """
-    state = SessionState.from_gradio(state_payload)
-    question = user_question.strip()
-
-    if not question:
-        yield "❌ Please provide a question.", "", 0, state.to_gradio(); return
-    if video_url.strip() and not get_video_id(video_url):
-        yield "❌ Invalid YouTube URL.", "", 0, state.to_gradio(); return
-    if not video_url.strip() and not state.processed_transcript:
-        yield "❌ No transcript in session. Provide a YouTube URL first.", "", 0, state.to_gradio(); return
-
-    try:
-        progress = 0
-        yield "🚀 Starting Q&A pipeline...", "", progress, state.to_gradio()
-
-        if state.needs_transcript_refresh(video_url):
+        try:
             transcript: Optional[str] = None
             segments: Optional[List[TranscriptSegment]] = None
-            for update in fetch_transcript_from_stt_stream(video_url, RUNTIME):
-                progress = min(40, max(5, int(update.progress * 0.4)))
+            stt_progress = 0
+            summary_progress = 0
+
+            yield "🚀 Starting pipeline...", "", "", "", "", 0, 0, state.to_gradio()
+
+            # ── STT phase ───────────────────────────────────────────────────
+            for update in fetch_transcript_from_stt_stream(video_url, runtime):
+                stt_progress = update.progress
+                # Keep the most recent non-None values across yields.
                 transcript = update.transcript or transcript
                 segments = update.segments or segments
-                yield update.message, "", progress, state.to_gradio()
+                yield (
+                    update.message,
+                    "",
+                    transcript or "",
+                    "",
+                    "",
+                    stt_progress,
+                    summary_progress,
+                    state.to_gradio(),
+                )
+
             if not transcript or not segments:
-                raise RuntimeError("Failed to fetch transcript.")
+                raise RuntimeError("Transcript fetch failed — no text or segments.")
+
             state.set_transcript(video_url, transcript, segments)
-        elif not state.transcript_segments:
-            raise RuntimeError(
-                "Session has transcript text but no timestamped segments. "
-                "Re-run Summarize to rebuild the session."
+
+            # ── Token budget info ────────────────────────────────────────────
+            token_count = estimate_tokens(state.processed_transcript)
+            mode = "direct" if token_count <= CFG.max_transcript_tokens else "chunked"
+            token_info = (
+                f"{token_count} tokens "
+                f"(limit ~{CFG.max_transcript_tokens}) | mode={mode}"
+            )
+            stats_info = (
+                f"chars={len(state.processed_transcript)} "
+                f"| tokens={token_count} "
+                f"| segments={len(state.transcript_segments)}"
+            )
+            summary_progress = 5
+            yield (
+                "🔢 Counting tokens...",
+                token_info,
+                state.processed_transcript,
+                "",
+                stats_info,
+                stt_progress,
+                summary_progress,
+                state.to_gradio(),
             )
 
-        progress = 45
-        yield "🧩 Preparing timestamp-aware retrieval chunks...", "", progress, state.to_gradio()
-        get_or_create_chunks(state)
+            # ── Summary cache check ──────────────────────────────────────────
+            cached_summary = load_cached_summary(
+                state.video_id, state.transcript_hash, mode
+            )
+            if cached_summary:
+                state.summary = cached_summary
+                elapsed = time.perf_counter() - started_at
+                yield (
+                    f"✅ Done in {elapsed:.2f}s (cached summary).",
+                    token_info,
+                    state.processed_transcript,
+                    state.summary,
+                    stats_info,
+                    100,
+                    100,
+                    state.to_gradio(),
+                )
+                return
 
-        progress = 65
-        yield "🗂️ Loading or building FAISS index...", "", progress, state.to_gradio()
-        faiss_index = get_or_create_faiss(state, RUNTIME)
+            # ── Summary generation ───────────────────────────────────────────
+            for update in summarize_transcript_stream(
+                state.processed_transcript, runtime
+            ):
+                summary_progress = update.progress
+                if update.summary:
+                    state.summary = update.summary
+                yield (
+                    update.message,
+                    token_info,
+                    state.processed_transcript,
+                    state.summary,
+                    stats_info,
+                    stt_progress,
+                    summary_progress,
+                    state.to_gradio(),
+                )
 
-        progress = 80
-        yield "🔎 Searching transcript for relevant context...", "", progress, state.to_gradio()
-        with log_time("FAISS similarity search"):
-            docs = faiss_index.similarity_search(question, k=CFG.retrieval_top_k)
+            if not state.summary:
+                raise RuntimeError("Summary generation returned empty output.")
 
-        if not docs:
+            save_summary(state.video_id, state.transcript_hash, mode, state.summary)
+            elapsed = time.perf_counter() - started_at
+            yield (
+                f"✅ Done in {elapsed:.2f}s.",
+                token_info,
+                state.processed_transcript,
+                state.summary,
+                stats_info,
+                100,
+                100,
+                state.to_gradio(),
+            )
+
+        except Exception as exc:
+            logger.exception("Summarize pipeline error")
+            yield (
+                f"❌ Error: {exc}",
+                "", "", "", "", 0, 0, state.to_gradio(),
+            )
+
+    return summarize_video_gradio
+
+
+def _make_qa_handler(runtime: RuntimeDeps):
+    """Factory returning answer_question_gradio closed over runtime.
+
+    Same motivation as _make_summarize_handler: the closure keeps the module
+    importable without side effects so the test suite can stub runtime.
+    """
+    def answer_question_gradio(
+        video_url: str,
+        user_question: str,
+        state_payload: Dict[str, Any],
+    ) -> Generator:
+        """Run timestamp-aware transcript Q&A and stream UI updates.
+
+        Pipeline: validate input → refresh transcript if needed → build chunks
+        → build FAISS index → similarity search → build context
+        → generate answer → render citations.
+
+        Streams four outputs: (status, answer, progress, state).
+        Skips transcript fetch if the session already has it cached.
+        """
+        state = SessionState.from_gradio(state_payload)
+        question = user_question.strip()
+
+        # ── Input validation ─────────────────────────────────────────────────
+        if not question:
+            yield "❌ Please provide a question.", "", 0, state.to_gradio()
+            return
+        if video_url.strip() and not get_video_id(video_url):
+            yield "❌ Invalid YouTube URL.", "", 0, state.to_gradio()
+            return
+        if not video_url.strip() and not state.processed_transcript:
+            yield (
+                "❌ No transcript in session. Provide a YouTube URL first.",
+                "", 0, state.to_gradio(),
+            )
+            return
+
+        try:
+            progress = 0
+            yield "🚀 Starting Q&A pipeline...", "", progress, state.to_gradio()
+
+            # ── Transcript fetch (skipped when session already has it) ────────
+            if state.needs_transcript_refresh(video_url):
+                transcript: Optional[str] = None
+                segments: Optional[List[TranscriptSegment]] = None
+
+                for update in fetch_transcript_from_stt_stream(video_url, runtime):
+                    # Scale STT progress into 0-40 % of the overall bar.
+                    progress = min(40, max(5, int(update.progress * 0.4)))
+                    transcript = update.transcript or transcript
+                    segments = update.segments or segments
+                    yield update.message, "", progress, state.to_gradio()
+
+                if not transcript or not segments:
+                    raise RuntimeError("Failed to fetch transcript.")
+                state.set_transcript(video_url, transcript, segments)
+
+            elif not state.transcript_segments:
+                raise RuntimeError(
+                    "Session has transcript text but no timestamped segments. "
+                    "Re-run Summarize to rebuild the session."
+                )
+
+            # ── Retrieval chunk preparation ──────────────────────────────────
+            progress = 45
+            yield (
+                "🧩 Preparing timestamp-aware retrieval chunks...",
+                "", progress, state.to_gradio(),
+            )
+            get_or_create_chunks(state)
+
+            # ── FAISS index ──────────────────────────────────────────────────
+            progress = 65
+            yield (
+                "🗂️ Loading or building FAISS index...",
+                "", progress, state.to_gradio(),
+            )
+            faiss_index = get_or_create_faiss(state, runtime)
+
+            # ── Similarity search ────────────────────────────────────────────
+            progress = 80
+            yield (
+                "🔎 Searching transcript for relevant context...",
+                "", progress, state.to_gradio(),
+            )
+            with log_time("FAISS similarity search"):
+                docs = faiss_index.similarity_search(question, k=CFG.retrieval_top_k)
+
+            if not docs:
+                state.last_question = question
+                state.last_answer = (
+                    "I couldn't find relevant transcript evidence "
+                    "for that question."
+                )
+                yield "✅ Answer ready.", state.last_answer, 100, state.to_gradio()
+                return
+
+            context, source_lookup = build_context_with_sources(docs, state.video_id)
+            if not context.strip():
+                state.last_question = question
+                state.last_answer = (
+                    "I couldn't build usable context from the "
+                    "retrieved transcript chunks."
+                )
+                yield "✅ Answer ready.", state.last_answer, 100, state.to_gradio()
+                return
+
+            # ── LLM answer generation ────────────────────────────────────────
+            progress = 90
+            yield (
+                f"🧠 Context ready "
+                f"({estimate_tokens(context)} tokens). Generating answer...",
+                "", progress, state.to_gradio(),
+            )
+            with log_time("QA generation"):
+                raw_answer = runtime.qa_chain.run(
+                    context=context, question=question
+                ).strip()
+
             state.last_question = question
-            state.last_answer = "I couldn't find relevant transcript evidence for that question."
-            yield "✅ Answer ready.", state.last_answer, 100, state.to_gradio(); return
+            state.last_answer = render_clickable_answer(raw_answer, source_lookup)
+            yield "✅ Answer ready.", state.last_answer, 100, state.to_gradio()
 
-        context, source_lookup = build_context_with_sources(docs, state.video_id)
-        if not context.strip():
-            state.last_question = question
-            state.last_answer = "I couldn't build usable context from the retrieved transcript chunks."
-            yield "✅ Answer ready.", state.last_answer, 100, state.to_gradio(); return
+        except Exception as exc:
+            logger.exception("Q&A pipeline error")
+            yield f"❌ Error: {exc}", "", 0, state.to_gradio()
 
-        progress = 90
-        yield (f"🧠 Context ready ({estimate_tokens(context)} tokens). Generating answer...",
-               "", progress, state.to_gradio())
-        with log_time("QA generation"):
-            raw_answer = RUNTIME.qa_chain.run(
-                context=context, question=question
-            ).strip()
-
-        state.last_question = question
-        state.last_answer = render_clickable_answer(raw_answer, source_lookup)
-        yield "✅ Answer ready.", state.last_answer, 100, state.to_gradio()
-
-    except Exception as exc:
-        logger.exception("Q&A pipeline error")
-        yield f"❌ Error: {exc}", "", 0, state.to_gradio()
+    return answer_question_gradio
 
 
 # =============================================================================
@@ -1753,7 +1875,13 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
             Label: status
             Slider: progress
             Markdown: answer (supports clickable timestamp links)
+
+    A hidden gr.State component carries the SessionState payload between
+    handler calls.  Both handlers receive it as their last input and emit
+    an updated payload as their last output.
     """
+    summarize_handler = _make_summarize_handler(runtime)
+    qa_handler = _make_qa_handler(runtime)
 
     with gr.Blocks(title="YouTube STT Summarizer & Q&A") as interface:
         session_state = gr.State(value={})
@@ -1811,7 +1939,7 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
                     )
 
                 summarize_btn.click(
-                    fn=summarize_video_gradio,
+                    fn=summarize_handler,
                     inputs=[video_url_sum, session_state],
                     outputs=[
                         status_sum,
@@ -1856,7 +1984,7 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
                 answer_out = gr.Markdown(label="Answer")
 
                 ask_btn.click(
-                    fn=answer_question_gradio,
+                    fn=qa_handler,
                     inputs=[video_url_qa, question_input, session_state],
                     outputs=[status_qa, answer_out, qa_progress, session_state],
                 )
@@ -1867,28 +1995,31 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
 # =============================================================================
 # ENTRYPOINT
 # =============================================================================
-# Module-level singletons — initialised at import time so handler functions
-# can reference them directly without a closure.
-RUNTIME: RuntimeDeps = build_runtime()
-INTERFACE: gr.Blocks = build_interface(RUNTIME)
-
 
 def main() -> None:
     """Application entrypoint.
 
     Execution order:
-        1. PATHS.ensure()   — create cache directories before any handler runs.
-        2. .queue()         — enable Gradio's event queue with concurrency
-                              limited to 1 to protect the local Ollama server
-                              from parallel inference requests.
-        3. .launch()        — start the Gradio server; blocks until stopped.
+        1. PATHS.ensure()         — create cache directories.
+        2. build_runtime()        — initialise Whisper + Ollama; blocks on
+                                    health check.
+        3. build_interface(runtime) — construct the Gradio Blocks UI wired to
+                                    the runtime-bound handler factories.
+        4. .queue()               — serialise requests to the local Ollama
+                                    server (concurrency limit = 1).
+        5. .launch()              — start the Gradio server; blocks until
+                                    stopped.
+
+    runtime and interface are local variables here, not module globals.
+    The module now imports cleanly without side effects, which makes it
+    straightforward to unit-test individual functions.
     """
     PATHS.ensure()
-    INTERFACE.queue(default_concurrency_limit=1)
-    INTERFACE.launch(server_name="localhost", server_port=7860)
+    runtime = build_runtime()
+    interface = build_interface(runtime)
+    interface.queue(default_concurrency_limit=1)
+    interface.launch(server_name="localhost", server_port=7860)
 
 
 if __name__ == "__main__":
     main()
-
-

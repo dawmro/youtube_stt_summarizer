@@ -32,6 +32,7 @@ from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import OllamaEmbeddings
+from langchain_community.vectorstores import FAISS
 from langchain_community.llms import Ollama
 
 
@@ -991,6 +992,60 @@ class SourceRef:
     url: str
     chunk_id: Optional[int]
     text: str
+
+
+# =============================================================================
+# SESSION STATE  (minimal)
+# =============================================================================
+
+@dataclass
+class SessionState:
+    """Per-user session container for transcript and retrieval state."""
+    video_id: str = ""
+    transcript_hash: str = ""
+    transcript_segments: List[TranscriptSegment] = field(default_factory=list)
+    chunks: Optional[List[RetrievalChunk]] = None
+    faiss_index: Optional[Any] = None
+
+# =============================================================================
+# FAISS INDEX — BUILD (no disk cache yet)
+# =============================================================================
+
+def get_or_create_faiss(state: SessionState, runtime: RuntimeDeps) -> FAISS:
+    """Return the FAISS index for the active session, building it if necessary.
+
+    Layer 1 — in-memory: if state.faiss_index is already populated from an
+    earlier call in this session, return it immediately (no I/O, no embedding).
+
+    Layer 2 — build fresh: convert state.chunks into FAISS documents.  Each
+    document's metadata carries start, end, and chunk_id so source lookups
+    after similarity_search are O(1).
+
+    Callers must ensure state.chunks is populated before calling this function.
+    """
+    if state.faiss_index is not None:
+        logger.info("FAISS index found in session memory — reusing.")
+        return state.faiss_index
+
+    if not state.chunks:
+        raise RuntimeError(
+            "Cannot build FAISS index: state.chunks is empty. "
+            "Call get_or_create_chunks(state) first."
+        )
+
+    logger.info("Building FAISS index from %d chunks...", len(state.chunks))
+    texts = [chunk.text for chunk in state.chunks]
+    metadatas = [
+        {"start": chunk.start, "end": chunk.end, "chunk_id": chunk.chunk_id}
+        for chunk in state.chunks
+    ]
+
+    with log_time("FAISS index build"):
+        faiss_index = FAISS.from_texts(texts, runtime.embeddings, metadatas=metadatas)
+
+    state.faiss_index = faiss_index
+    logger.info("FAISS index built and stored in session memory.")
+    return faiss_index
 
 
 

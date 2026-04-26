@@ -870,6 +870,39 @@ def load_cached_summary(
     return summary or None
 
 
+# =============================================================================
+# RETRIEVAL DATA MODEL
+# =============================================================================
+
+@dataclass
+class RetrievalChunk:
+    """Retrieval unit stored in cache and indexed into FAISS.
+
+    Each chunk covers a contiguous window of TranscriptSegment objects.
+    segment_ids records which segments are included so source timestamps can
+    be recovered after a FAISS similarity search without re-scanning the full
+    transcript.
+    """
+    chunk_id: int
+    text: str
+    start: float
+    end: float
+    segment_ids: List[int]
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RetrievalChunk":
+        return cls(
+            chunk_id=int(data["chunk_id"]),
+            text=str(data["text"]),
+            start=float(data["start"]),
+            end=float(data["end"]),
+            segment_ids=[int(x) for x in data.get("segment_ids", [])],
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 
 video_url = "https://www.youtube.com/watch?v=BSuAgw8Lc1Y"
 video_id = require_video_id(video_url)

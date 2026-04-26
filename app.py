@@ -26,6 +26,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
 
+import tiktoken
 from faster_whisper import WhisperModel
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_community.llms import Ollama
@@ -132,6 +133,7 @@ class CachePaths:
 
 CFG = AppConfig()
 PATHS = CachePaths.from_base_dir(CFG.base_dir)
+TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
 
 
 # =============================================================================
@@ -204,6 +206,11 @@ def log_time(label: str) -> Generator[None, None, None]:
         yield
     finally:
         logger.info("END: %s (%.2fs)", label, time.perf_counter() - start)
+
+
+def estimate_tokens(text: str) -> int:
+    """Estimate tokens for prompt-budget decisions."""
+    return len(TIKTOKEN_ENC.encode(text))
 
 
 def run_command(cmd: List[str]) -> None:
@@ -579,7 +586,7 @@ cached = load_cached_transcript(video_id)
 transcript, segments, transcript_hash_value = cached
 logger.info(f"Cached transcript: \n{transcript}")
 logger.info(f"Cached structured segments: \n{segments}")
-logger.info(f"Transcript hash value: \n{transcript_hash_value}")
+logger.info(f"Transcript hash value: {transcript_hash_value}")
 
 ensure_ollama_ready(CFG.ollama_base_url, [CFG.llm_model, CFG.embedding_model])
 
@@ -594,3 +601,6 @@ embeddings = OllamaEmbeddings(
     base_url=CFG.ollama_base_url,
 )
 warmup_ollama_clients(llm, embeddings)
+
+tokens = estimate_tokens(transcript)
+logger.info(f"Estimated tokens: {tokens}")

@@ -138,6 +138,11 @@ CFG = AppConfig()
 PATHS = CachePaths.from_base_dir(CFG.base_dir)
 TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
 
+# Compiled patterns used by render_clickable_answer.
+# Defined at module level so they are compiled once, not per call.
+SOURCE_GROUP_PATTERN = re.compile(r"\[((?:S\d+\s*(?:,\s*S\d+\s*)*))\]")
+SOURCE_SINGLE_PATTERN = re.compile(r"(?<!\[)(S\d+)(?!\])")
+
 
 # =============================================================================
 # HASHES / CONFIG SNAPSHOTS
@@ -1216,6 +1221,74 @@ def build_context_with_sources(
 
     context = "\n\n".join(context_parts)
     return context, source_lookup
+
+
+# =============================================================================
+# CITATION RENDERER
+# =============================================================================
+
+def render_clickable_answer(
+    raw_answer: str, source_lookup: Dict[str, "SourceRef"]
+) -> str:
+    """Replace [S1]-style LLM citations with clickable Markdown timestamp links.
+
+    The LLM may cite sources in two patterns:
+        Grouped  — [S1, S2, S3]   matched by SOURCE_GROUP_PATTERN
+        Isolated — [S1]           matched by SOURCE_SINGLE_PATTERN
+
+    Both are replaced with inline Markdown links that open the YouTube video at
+    the correct timestamp.  A deduplicated **References** section is appended
+    listing every source the LLM actually cited.
+
+    Deduplication uses dict.fromkeys for O(n) order-preserving uniqueness —
+    faster than the O(n²) "if x not in seen" pattern for long answers.
+    """
+
+    rendered = raw_answer
+    used_labels: List[str] = []
+
+    def _replace_group(match: re.Match) -> str:
+        """Replace [S1, S2, S3] with individual inline links."""
+        labels = [lbl.strip() for lbl in match.group(1).split(",")]
+        parts: List[str] = []
+        for lbl in labels:
+            ref = source_lookup.get(lbl)
+            if ref:
+                parts.append(f"[{ref.label}]({ref.url})")
+                used_labels.append(lbl)
+            else:
+                parts.append(f"[{lbl}]")
+        return " ".join(parts)
+
+    def _replace_single(match: re.Match) -> str:
+        """Replace an isolated S1 token (already outside brackets) with a link."""
+        lbl = match.group(1)
+        ref = source_lookup.get(lbl)
+        if ref:
+            used_labels.append(lbl)
+            return f"[{ref.label}]({ref.url})"
+        return lbl
+
+    # Process grouped citations first so SOURCE_SINGLE_PATTERN doesn't
+    # partially match inside a group like [S1, S2].
+    rendered = SOURCE_GROUP_PATTERN.sub(_replace_group, rendered)
+    rendered = SOURCE_SINGLE_PATTERN.sub(_replace_single, rendered)
+
+    # Append a deduplicated References section for every cited source.
+    seen = dict.fromkeys(used_labels)  # O(n), preserves first-seen order
+    cited_refs = [
+        (lbl, source_lookup[lbl])
+        for lbl in seen
+        if lbl in source_lookup
+    ]
+
+    if cited_refs:
+        ref_lines = ["\n\n**References**"]
+        for lbl, ref in cited_refs:
+            ref_lines.append(f"- [{ref.label}]({ref.url})")
+        rendered += "\n".join(ref_lines)
+
+    return rendered
 
 
 

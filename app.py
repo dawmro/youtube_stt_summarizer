@@ -2,10 +2,15 @@ import logging
 import os
 import re
 import subprocess
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional
 
+
+# =============================================================================
+# LOGGING
+# =============================================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,6 +22,69 @@ logger = logging.getLogger(__name__)
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = "4"
 
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    """Application configuration and cache-version inputs.
+
+    Business logic:
+    cache correctness depends on runtime settings. When model or chunking
+    settings change, cache keys should change too.
+
+    Note: embed_chunk_size is measured in characters, not tokens.
+    """
+
+    base_dir: Path = Path(__file__).resolve().parent
+    llm_model: str = "llama3.1:8b-instruct-q8_0"
+    embedding_model: str = "mxbai-embed-large" # "nomic-embed-text" or "mxbai-embed-large"
+    ollama_base_url: str = "http://localhost:11434"
+
+    llm_context_limit: int = 8192
+    safety_margin: int = 1024
+
+    summary_chunk_overlap_tokens: int = 256
+    max_summary_passes: int = 4
+
+    # Character-based limit for retrieval chunks (not token-based).
+    embed_chunk_size: int = 1000
+    embed_chunk_overlap_segments: int = 1
+    retrieval_top_k: int = 4
+
+    whisper_model_size: str = "small"   # "small", "Medium", "large-v3"
+    whisper_device: str = "cpu"         # "cpu" or "cuda"
+    whisper_compute_type: str = "int8"  # "int8" or "float16"
+    whisper_language: Optional[str] = None
+    whisper_beam_size: int = 1          # usually 1-5 
+    whisper_vad_filter: bool = False    # quality: True, speed: False
+    whisper_condition_on_previous_text: bool = False    # quality: True, speed: False
+    whisper_word_timestamps: bool = True
+
+    summary_prompt_version: str = "summary-v1"
+    retrieval_prompt_version: str = "qa-with-timestamps-v1"
+    transcript_schema_version: str = "timestamped-transcript-v1"
+    retrieval_schema_version: str = "timestamped-retrieval-v1"
+    trust_faiss_cache: bool = True
+
+    @property
+    def max_transcript_tokens(self) -> int:
+        return self.llm_context_limit - self.safety_margin
+
+    @property
+    def summary_target_tokens(self) -> int:
+        return self.max_transcript_tokens // 2
+    
+
+CFG = AppConfig()
+
+
+# =============================================================================
+# GENERAL UTILS
+# =============================================================================
 
 def run_command(cmd: List[str]) -> None:
     """Execute a subprocess command and raise a readable error if it fails."""

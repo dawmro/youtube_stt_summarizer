@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Generator, Iterable, List, NamedTuple, Optional, Tuple
 
 import tiktoken
 from faster_whisper import WhisperModel
@@ -684,6 +684,53 @@ def load_cached_transcript(
     return transcript, segments, transcript_hash_value
 
 
+# =============================================================================
+# TYPED GENERATOR YIELDS
+# ============================================================================
+
+class SummaryUpdate(NamedTuple):
+    """Streaming update yielded by summarize_transcript_stream.
+
+    Fields:
+        message  — human-readable status line shown in the UI status label.
+        summary  — the finished summary text, or None while still generating.
+        progress — integer 0-100 for the progress bar.
+    """
+    message: str
+    summary: Optional[str]
+    progress: int
+
+
+# =============================================================================
+# SUMMARIZATION PIPELINE
+# =============================================================================
+
+def summarize_transcript_stream(
+    text: str,
+    runtime: RuntimeDeps,
+) -> Generator[SummaryUpdate, None, None]:
+    """Summarize a transcript, yielding typed status updates for the UI.
+
+    For transcripts that fit within the model context window the full text is
+    sent to the LLM in a single call (direct mode).  
+    """
+    if estimate_tokens(text) <= CFG.max_transcript_tokens:
+        yield SummaryUpdate("📝 Generating direct summary...", None, 30)
+        with log_time("direct summary generation"):
+            summary = runtime.summary_chain.predict(transcript=text).strip()
+        if not summary:
+            raise RuntimeError("Direct summary generation returned empty output.")
+        yield SummaryUpdate("✅ Final summary ready.", summary, 100)
+        return
+
+    # Transcripts longer than the context window are not yet supported.
+    raise RuntimeError(
+        f"Transcript is too long ({estimate_tokens(text)} tokens) for direct "
+        "summarization. Chunked support coming soon."
+    )
+
+
+
 video_url = "https://www.youtube.com/watch?v=BSuAgw8Lc1Y"
 video_id = require_video_id(video_url)
 
@@ -737,3 +784,6 @@ tokens = estimate_tokens(transcript)
 logger.info(f"Estimated tokens: {tokens}")
 
 runtime = build_runtime()
+message, summary = summarize_transcript_stream(transcript, runtime)
+
+logger.info(message, summary)

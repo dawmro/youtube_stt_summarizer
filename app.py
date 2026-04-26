@@ -1714,6 +1714,129 @@ def _make_summarize_handler(runtime: RuntimeDeps):
     return summarize_video_gradio
 
 
+def _make_qa_handler(runtime: RuntimeDeps):
+    """Factory that closes over runtime and returns the Q&A Gradio callback.
+
+    The inner generator yields 4 values on every update:
+        (status, answer, progress, state)
+    """
+
+    def answer_question_gradio(
+        video_url: str,
+        user_question: str,
+        state_payload: Dict[str, Any],
+    ) -> Generator:
+        """Run timestamp-aware transcript Q&A and stream UI updates."""
+        state = SessionState.from_gradio(state_payload)
+        question = user_question.strip()
+
+        # ── Input validation ─────────────────────────────────────────────────
+        if not question:
+            yield "❌ Please provide a question.", "", 0, state.to_gradio()
+            return
+        if video_url.strip() and not get_video_id(video_url):
+            yield "❌ Invalid YouTube URL.", "", 0, state.to_gradio()
+            return
+        if not video_url.strip() and not state.processed_transcript:
+            yield (
+                "❌ No transcript in session. Provide a YouTube URL first.",
+                "", 0, state.to_gradio(),
+            )
+            return
+
+        try:
+            progress = 0
+            yield "🚀 Starting Q&A pipeline...", "", progress, state.to_gradio()
+
+            # ── Transcript fetch (skipped when session already has it) ────────
+            if state.needs_transcript_refresh(video_url):
+                transcript: Optional[str] = None
+                segments: Optional[List[TranscriptSegment]] = None
+
+                for update in fetch_transcript_from_stt_stream(video_url, runtime):
+                    # Scale STT progress into 0-40 % of the overall bar.
+                    progress = min(40, max(5, int(update.progress * 0.4)))
+                    transcript = update.transcript or transcript
+                    segments = update.segments or segments
+                    yield update.message, "", progress, state.to_gradio()
+
+                if not transcript or not segments:
+                    raise RuntimeError("Failed to fetch transcript.")
+                state.set_transcript(video_url, transcript, segments)
+
+            elif not state.transcript_segments:
+                raise RuntimeError(
+                    "Session has transcript text but no timestamped segments. "
+                    "Re-run Summarize to rebuild the session."
+                )
+
+            # ── Retrieval chunk preparation ──────────────────────────────────
+            progress = 45
+            yield (
+                "🧩 Preparing timestamp-aware retrieval chunks...",
+                "", progress, state.to_gradio(),
+            )
+            get_or_create_chunks(state)
+
+            # ── FAISS index ──────────────────────────────────────────────────
+            progress = 65
+            yield (
+                "🗂️ Loading or building FAISS index...",
+                "", progress, state.to_gradio(),
+            )
+            faiss_index = get_or_create_faiss(state, runtime)
+
+            # ── Similarity search ────────────────────────────────────────────
+            progress = 80
+            yield (
+                "🔎 Searching transcript for relevant context...",
+                "", progress, state.to_gradio(),
+            )
+            with log_time("FAISS similarity search"):
+                docs = faiss_index.similarity_search(question, k=CFG.retrieval_top_k)
+
+            if not docs:
+                state.last_question = question
+                state.last_answer = (
+                    "I couldn't find relevant transcript evidence "
+                    "for that question."
+                )
+                yield "✅ Answer ready.", state.last_answer, 100, state.to_gradio()
+                return
+
+            context, source_lookup = build_context_with_sources(docs, state.video_id)
+            if not context.strip():
+                state.last_question = question
+                state.last_answer = (
+                    "I couldn't build usable context from the "
+                    "retrieved transcript chunks."
+                )
+                yield "✅ Answer ready.", state.last_answer, 100, state.to_gradio()
+                return
+
+            # ── LLM answer generation ────────────────────────────────────────
+            progress = 90
+            yield (
+                f"🧠 Context ready "
+                f"({estimate_tokens(context)} tokens). Generating answer...",
+                "", progress, state.to_gradio(),
+            )
+            with log_time("QA generation"):
+                raw_answer = runtime.qa_chain.predict(
+                    context=context, question=question
+                ).strip()
+
+            state.last_question = question
+            state.last_answer = render_clickable_answer(raw_answer, source_lookup)
+            yield "✅ Answer ready.", state.last_answer, 100, state.to_gradio()
+
+        except Exception as exc:
+            logger.exception("Q&A pipeline error")
+            yield f"❌ Error: {exc}", "", 0, state.to_gradio()
+
+    return answer_question_gradio
+
+
 
 
 video_url = "https://www.youtube.com/watch?v=BSuAgw8Lc1Y"

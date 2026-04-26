@@ -709,6 +709,103 @@ class SummaryUpdate(NamedTuple):
     summary: Optional[str]
     progress: int
 
+
+# =============================================================================
+# STT STREAMING PIPELINE
+# =============================================================================
+
+def fetch_transcript_from_stt_stream(
+    video_url: str,
+    runtime: RuntimeDeps,
+) -> Generator[SttUpdate, None, None]:
+    """Download, convert, and transcribe a YouTube video, yielding typed updates.
+
+    Full pipeline with progress checkpoints:
+
+        10 % — audio download starts (yt-dlp)
+        30 % — audio conversion starts (ffmpeg → 16kHz mono WAV)
+        55 % — Whisper transcription starts (may take several minutes)
+        90 % — transcript saved to JSON cache
+       100 % — final SttUpdate with full transcript text and typed segments
+
+    Cache fast-exit:
+        If a cached transcript exists for the current video_id and STT config,
+        a single SttUpdate at 100 % is yielded immediately and the function
+        returns — no download, no conversion, no Whisper call.
+
+    Intermediate SttUpdate yields carry None in the transcript and segments
+    fields.  Callers must guard against None before consuming those values.
+    """
+    video_id = require_video_id(video_url)
+
+    # ── 1. Cache check ──────────────────────────────────────────────────────
+    cached = load_cached_transcript(video_id)
+    if cached:
+        transcript, segments, _ = cached
+        logger.info(
+            "Transcript cache hit for %s (%d chars, %d segments).",
+            video_id, len(transcript), len(segments),
+        )
+        yield SttUpdate(
+            message="✅ Using cached transcript.",
+            transcript=transcript,
+            segments=segments,
+            progress=100,
+        )
+        return
+
+    # ── 2. Audio download ───────────────────────────────────────────────────
+    yield SttUpdate(
+        message="⬇️ Downloading audio from YouTube...",
+        transcript=None,
+        segments=None,
+        progress=10,
+    )
+    audio_dir = PATHS.audio / video_id
+    with log_time("yt-dlp download"):
+        raw_audio = download_audio(video_url, audio_dir)
+    logger.info("Downloaded audio: %s", raw_audio)
+
+    # ── 3. Audio conversion ─────────────────────────────────────────────────
+    yield SttUpdate(
+        message="🔄 Converting audio to 16 kHz mono WAV...",
+        transcript=None,
+        segments=None,
+        progress=30,
+    )
+    wav_path = audio_dir / "audio.wav"
+    with log_time("ffmpeg convert"):
+        convert_to_wav_16k_mono(raw_audio, wav_path)
+
+    # ── 4. Whisper transcription ────────────────────────────────────────────
+    yield SttUpdate(
+        message="🎙️ Transcribing with Whisper (this may take a while)...",
+        transcript=None,
+        segments=None,
+        progress=55,
+    )
+    transcript, segments = transcribe_audio(wav_path, runtime)
+
+    # ── 5. Persist to cache ─────────────────────────────────────────────────
+    yield SttUpdate(
+        message="💾 Saving transcript to cache...",
+        transcript=transcript,
+        segments=segments,
+        progress=90,
+    )
+    save_transcript(video_id, transcript, segments)
+
+    # ── 6. Final yield ──────────────────────────────────────────────────────
+    yield SttUpdate(
+        message=(
+            f"✅ Transcript ready "
+            f"({len(transcript)} chars, {len(segments)} segments)."
+        ),
+        transcript=transcript,
+        segments=segments,
+        progress=100,
+    )
+
 # =============================================================================
 # SUMMARIZATION PIPELINE
 # =============================================================================
@@ -1471,58 +1568,8 @@ def render_clickable_answer(
 
 
 video_url = "https://www.youtube.com/watch?v=BSuAgw8Lc1Y"
-video_id = require_video_id(video_url)
-
-source_dir = PATHS.ytdlp / video_id
-audio_dir = PATHS.audio / video_id
-wav_path = audio_dir / "audio.wav"
-
-with log_time("Getting source audio"):
-    source_audio = download_audio(video_id, source_dir)
-with log_time("Converting to WAV"):    
-    convert_to_wav_16k_mono(source_audio, wav_path)
-logger.info(build_youtube_time_url(video_id, 245))
-
-logger.info(STT_CONFIG_HASH)
-logger.info(SUMMARY_CONFIG_HASH)
-logger.info(RETRIEVAL_CONFIG_HASH)
-
-whisper_model = WhisperModel(
-    CFG.whisper_model_size,
-    device=CFG.whisper_device,
-    compute_type=CFG.whisper_compute_type,
-)
-
-with log_time("Transcribing audio"): 
-    transcript, segments = transcribe_audio(wav_path, whisper_model)
-logger.info(f"Transcript: \n{transcript}")
-logger.info(f"Structured Segments: \n{segments}")
-
-save_transcript(video_id, transcript, segments)
-cached = load_cached_transcript(video_id)
-transcript, segments, transcript_hash_value = cached
-logger.info(f"Cached transcript: \n{transcript}")
-logger.info(f"Cached structured segments: \n{segments}")
-logger.info(f"Transcript hash value: {transcript_hash_value}")
-
-ensure_ollama_ready(CFG.ollama_base_url, [CFG.llm_model, CFG.embedding_model])
-
-llm = Ollama(
-    model=CFG.llm_model,
-    temperature=0.7,
-    top_p=0.9,
-    base_url=CFG.ollama_base_url,
-)
-embeddings = OllamaEmbeddings(
-    model=CFG.embedding_model,
-    base_url=CFG.ollama_base_url,
-)
-warmup_ollama_clients(llm, embeddings)
-
-tokens = estimate_tokens(transcript)
-logger.info(f"Estimated tokens: {tokens}")
 
 runtime = build_runtime()
-message, summary = summarize_transcript_stream(transcript, runtime)
 
-logger.info(message, summary)
+out = fetch_transcript_from_stt_stream(video_url, runtime)
+logger.info(next(out))

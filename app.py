@@ -12,7 +12,8 @@ Business goal:
 
 
 
-
+import hashlib
+import json
 import logging
 import os
 import re
@@ -20,7 +21,7 @@ import subprocess
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 
 # =============================================================================
@@ -124,6 +125,22 @@ class CachePaths:
 
 CFG = AppConfig()
 PATHS = CachePaths.from_base_dir(CFG.base_dir)
+
+
+# =============================================================================
+# HASHES / CONFIG SNAPSHOTS
+# =============================================================================
+
+def stable_hash_obj(obj: Dict[str, Any]) -> str:
+    """Return a short deterministic hash for config-based cache keys."""
+    raw = json.dumps(obj, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def text_hash(text: str) -> str:
+    """Return a short deterministic hash for content-based cache keys."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
 
 # =============================================================================
 # GENERAL UTILS

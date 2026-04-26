@@ -851,7 +851,7 @@ def summarize_transcript_stream(
     if estimate_tokens(text) <= CFG.max_transcript_tokens:
         yield SummaryUpdate("📝 Generating direct summary...", None, 30)
         with log_time("direct summary generation"):
-            summary = runtime.summary_chain.run(transcript=text).strip()
+            summary = runtime.summary_chain.predict(transcript=text).strip()
         if not summary:
             raise RuntimeError("Direct summary generation returned empty output.")
         yield SummaryUpdate("✅ Final summary ready.", summary, 100)
@@ -875,7 +875,7 @@ def summarize_transcript_stream(
                 f"📝 Summarizing chunk {idx}/{total}...", None, progress
             )
             with log_time(f"chunk summary {pass_idx}:{idx}/{total}"):
-                chunk_summary = runtime.chunk_summary_chain.run(
+                chunk_summary = runtime.chunk_summary_chain.predict(
                     chunk=chunk
                 ).strip()
             if not chunk_summary:
@@ -897,7 +897,7 @@ def summarize_transcript_stream(
                 90,
             )
             with log_time("final merged summary generation"):
-                final_summary = runtime.reduce_summary_chain.run(
+                final_summary = runtime.reduce_summary_chain.predict(
                     summaries=merged
                 ).strip()
             if not final_summary:
@@ -1837,7 +1837,7 @@ def _make_qa_handler(runtime: RuntimeDeps):
                 "", progress, state.to_gradio(),
             )
             with log_time("QA generation"):
-                raw_answer = runtime.qa_chain.run(
+                raw_answer = runtime.qa_chain.predict(
                     context=context, question=question
                 ).strip()
 

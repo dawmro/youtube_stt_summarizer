@@ -969,6 +969,30 @@ def build_retrieval_chunks(segments: List[TranscriptSegment]) -> List[RetrievalC
     return chunks
 
 
+# =============================================================================
+# SOURCE REFERENCE MODEL
+# =============================================================================
+
+@dataclass
+class SourceRef:
+    """Rendered source reference used in Q&A answers and the References section.
+
+    Fields:
+        start    — segment start time in seconds.
+        end      — segment end time in seconds.
+        label    — human-readable "HH:MM:SS - HH:MM:SS" range shown to the user.
+        url      — deep-link YouTube URL with ?t=Xs that jumps to the moment.
+        chunk_id — back-reference to the originating RetrievalChunk.
+        text     — the raw chunk text, available for tooltip previews.
+    """
+    start: float
+    end: float
+    label: str
+    url: str
+    chunk_id: Optional[int]
+    text: str
+
+
 
 video_url = "https://www.youtube.com/watch?v=BSuAgw8Lc1Y"
 video_id = require_video_id(video_url)

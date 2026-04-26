@@ -1008,23 +1008,141 @@ class SessionState:
     faiss_index: Optional[Any] = None
 
 # =============================================================================
-# FAISS INDEX — BUILD (no disk cache yet)
+# RETRIEVAL CACHE  (chunks JSON + FAISS index on disk)
 # =============================================================================
+
+def retrieval_record_path(video_id: str, transcript_hash_value: str) -> Path:
+    """Derive the cache directory for retrieval artifacts.
+
+    Pattern: retrieval/<video_id>__<retrieval_config_hash>__<transcript_hash>/
+    Both the embedding model settings and the transcript content are encoded
+    so either change automatically routes to a fresh build.
+    """
+    folder_name = f"{video_id}__{RETRIEVAL_CONFIG_HASH}__{transcript_hash_value}"
+    return PATHS.retrieval / folder_name
+
+
+def save_retrieval_cache(
+    video_id: str,
+    transcript_hash_value: str,
+    chunks: List[RetrievalChunk],
+    faiss_index: FAISS,
+) -> None:
+    """Persist RetrievalChunk list as JSON and FAISS index files to disk."""
+    cache_dir = retrieval_record_path(video_id, transcript_hash_value)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Chunk metadata (JSON) — human-readable, used to restore state.chunks.
+    write_json_atomic(
+        cache_dir / "chunks.json",
+        {
+            "video_id": video_id,
+            "transcript_hash": transcript_hash_value,
+            "chunks": [chunk.to_dict() for chunk in chunks],
+            "retrieval_config_hash": RETRIEVAL_CONFIG_HASH,
+            "retrieval_config": current_retrieval_config(),
+            "saved_at": time.time(),
+        },
+    )
+
+    # FAISS index — two binary files (index.faiss + index.pkl) written by
+    # LangChain's save_local helper.
+    faiss_index.save_local(str(cache_dir))
+    logger.info(
+        "Retrieval cache saved (%d chunks) → %s", len(chunks), cache_dir
+    )
+
+
+def load_retrieval_cache(
+    video_id: str,
+    transcript_hash_value: str,
+    embeddings: OllamaEmbeddings,
+) -> Optional[Tuple[List[RetrievalChunk], FAISS]]:
+    """Load chunks and FAISS index from disk when the cache directory exists.
+
+    Returns (chunks, faiss_index) or None on a cache miss or corrupted files.
+    allow_dangerous_deserialization is required by LangChain's load_local when
+    reading the pickle file that stores the docstore.
+    """
+    cache_dir = retrieval_record_path(video_id, transcript_hash_value)
+    chunks_path = cache_dir / "chunks.json"
+    faiss_path = cache_dir / "index.faiss"
+
+    if not chunks_path.exists() or not faiss_path.exists():
+        return None
+
+    data = read_json(chunks_path)
+    if not data or not isinstance(data.get("chunks"), list):
+        return None
+
+    try:
+        chunks = [RetrievalChunk.from_dict(item) for item in data["chunks"]]
+        faiss_index = FAISS.load_local(
+            str(cache_dir),
+            embeddings,
+            allow_dangerous_deserialization=True,
+        )
+        logger.info(
+            "Retrieval cache loaded (%d chunks) ← %s", len(chunks), cache_dir
+        )
+        return chunks, faiss_index
+    except Exception:
+        logger.warning(
+            "Retrieval cache at %s is corrupted — will rebuild.", cache_dir,
+            exc_info=True,
+        )
+        return None
+
+
+def get_or_create_chunks(state: SessionState) -> None:
+    """Populate state.chunks from cache or by building from transcript segments.
+
+    Mutates state in place.  A no-op when state.chunks is already set (e.g.
+    the FAISS index was rebuilt from the disk cache in get_or_create_faiss).
+    """
+    if state.chunks is not None:
+        return
+
+    cached = load_retrieval_cache(
+        state.video_id, state.transcript_hash, embeddings=None  # chunks only
+    )
+    # load_retrieval_cache returns None when the FAISS files are missing too,
+    # but the JSON chunk file may exist independently after a partial save.
+    # We skip the FAISS half here; get_or_create_faiss handles it.
+    if cached:
+        state.chunks, _ = cached
+        logger.info("Chunks loaded from retrieval cache (%d).", len(state.chunks))
+        return
+
+    logger.info(
+        "Building retrieval chunks from %d segments...",
+        len(state.transcript_segments),
+    )
+    with log_time("build_retrieval_chunks"):
+        state.chunks = build_retrieval_chunks(state.transcript_segments)
+    logger.info("Built %d retrieval chunks.", len(state.chunks))
+
 
 def get_or_create_faiss(state: SessionState, runtime: RuntimeDeps) -> FAISS:
     """Return the FAISS index for the active session, building it if necessary.
 
-    Layer 1 — in-memory: if state.faiss_index is already populated from an
-    earlier call in this session, return it immediately (no I/O, no embedding).
+    Three-layer lookup:
+        1. In-memory  — state.faiss_index already set from this session.
+        2. Disk cache — load_retrieval_cache finds matching files on disk.
+        3. Build fresh — embed state.chunks, build the index, persist to disk.
 
-    Layer 2 — build fresh: convert state.chunks into FAISS documents.  Each
-    document's metadata carries start, end, and chunk_id so source lookups
-    after similarity_search are O(1).
-
-    Callers must ensure state.chunks is populated before calling this function.
+    Callers must call get_or_create_chunks(state) before this function so
+    state.chunks is populated for layers 2 and 3.
     """
     if state.faiss_index is not None:
         logger.info("FAISS index found in session memory — reusing.")
+        return state.faiss_index
+
+    cached = load_retrieval_cache(
+        state.video_id, state.transcript_hash, runtime.embeddings
+    )
+    if cached:
+        state.chunks, state.faiss_index = cached
         return state.faiss_index
 
     if not state.chunks:
@@ -1044,8 +1162,12 @@ def get_or_create_faiss(state: SessionState, runtime: RuntimeDeps) -> FAISS:
         faiss_index = FAISS.from_texts(texts, runtime.embeddings, metadatas=metadatas)
 
     state.faiss_index = faiss_index
-    logger.info("FAISS index built and stored in session memory.")
+    save_retrieval_cache(
+        state.video_id, state.transcript_hash, state.chunks, faiss_index
+    )
+    logger.info("FAISS index built and persisted to retrieval cache.")
     return faiss_index
+
 
 
 

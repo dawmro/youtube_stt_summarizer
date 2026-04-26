@@ -803,6 +803,73 @@ def summarize_transcript_stream(
     )
 
 
+# =============================================================================
+# SUMMARY CACHE
+# =============================================================================
+
+def summary_record_path(
+    video_id: str, transcript_hash_value: str, mode: str
+) -> Path:
+    """Derive the cache file path for a summary.
+
+    Three inputs are encoded in the filename:
+        - video_id            — identifies the video.
+        - mode                — "direct" or "chunked"; kept separate so a
+                                change in strategy forces a fresh generation.
+        - SUMMARY_CONFIG_HASH — invalidates the cache when the LLM model,
+                                context limits, or prompt version change.
+        - transcript_hash_value — invalidates the cache when the transcript
+                                  content changes (e.g. different Whisper run).
+
+    Pattern: <video_id>__<mode>__<summary_config_hash>__<transcript_hash>.json
+    """
+    return (
+        PATHS.summary
+        / f"{video_id}__{mode}__{SUMMARY_CONFIG_HASH}__{transcript_hash_value}.json"
+    )
+
+
+def save_summary(
+    video_id: str, transcript_hash_value: str, mode: str, summary: str
+) -> None:
+    """Persist summary output tied to transcript content and summary strategy.
+
+    The mode field ("direct" / "chunked") is stored in the payload for
+    observability — it lets you tell at a glance which strategy produced the
+    cached result without reading the content.
+    """
+    write_json_atomic(
+        summary_record_path(video_id, transcript_hash_value, mode),
+        {
+            "video_id": video_id,
+            "transcript_hash": transcript_hash_value,
+            "summary": summary,
+            "mode": mode,
+            "summary_config_hash": SUMMARY_CONFIG_HASH,
+            "summary_config": current_summary_config(),
+            "saved_at": time.time(),
+        },
+    )
+
+
+def load_cached_summary(
+    video_id: str, transcript_hash_value: str, mode: str
+) -> Optional[str]:
+    """Load summary cache when the filename (config + transcript hash) matches.
+
+    No redundant in-body hash checks: the filename already encodes the full
+    cache key so a file that exists at the derived path is guaranteed to match
+    the current settings and transcript content.
+
+    Returns the summary string or None on a cache miss.
+    """
+    data = read_json(summary_record_path(video_id, transcript_hash_value, mode))
+    if not data:
+        return None
+    summary = str(data.get("summary", "")).strip()
+    return summary or None
+
+
 
 video_url = "https://www.youtube.com/watch?v=BSuAgw8Lc1Y"
 video_id = require_video_id(video_url)

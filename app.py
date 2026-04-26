@@ -695,6 +695,14 @@ def load_cached_transcript(
 # TYPED GENERATOR YIELDS
 # =============================================================================
 
+class SttUpdate(NamedTuple):
+    """Streaming update yielded by fetch_transcript_from_stt_stream."""
+    message: str
+    transcript: Optional[str]
+    segments: Optional[List[TranscriptSegment]]
+    progress: int
+
+
 class SummaryUpdate(NamedTuple):
     """Streaming update yielded by summarize_transcript_stream."""
     message: str

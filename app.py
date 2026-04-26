@@ -17,13 +17,14 @@ import json
 import logging
 import os
 import re
+import requests
 import subprocess
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
 
 from faster_whisper import WhisperModel
 
@@ -281,6 +282,50 @@ def write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
 
 
 # =============================================================================
+# MODEL INITIALIZATION
+# =============================================================================
+
+def normalize_model_name(name: str) -> str:
+    """Normalize Ollama model names by stripping variant suffixes."""
+    return name.strip().split(":", 1)[0]
+
+
+def ensure_ollama_ready(base_url: str, required_models: Iterable[str], timeout: float = 5.0) -> None:
+    """Fail fast when Ollama is offline or required models are missing.
+
+    Business logic:
+    validating availability during startup avoids wasting time on downloading and
+    transcribing audio before discovering that generation cannot run.
+    """
+    try:
+        response = requests.get(f"{base_url.rstrip('/')}/api/tags", timeout=timeout)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Ollama is not reachable at '{base_url}'. Make sure the server is running."
+        ) from exc
+
+    available_names = {
+        item.get("name").strip()
+        for item in data.get("models", [])
+        if isinstance(item, dict) and item.get("name")
+    }
+    available_base_names = {normalize_model_name(name) for name in available_names}
+
+    missing = [
+        model for model in required_models
+        if model not in available_names and normalize_model_name(model) not in available_base_names
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "Ollama is online, but required models are missing: "
+            f"{', '.join(missing)}. Available: {', '.join(sorted(available_names)) or '(none)'}"
+        )
+    
+
+# =============================================================================
 # AUDIO PIPELINE
 # =============================================================================
 
@@ -510,9 +555,12 @@ with log_time("Transcribing audio"):
     transcript, segments = transcribe_audio(wav_path, whisper_model)
 logger.info(f"Transcript: \n{transcript}")
 logger.info(f"Structured Segments: \n{segments}")
+
 save_transcript(video_id, transcript, segments)
 cached = load_cached_transcript(video_id)
 transcript, segments, transcript_hash_value = cached
 logger.info(f"Cached transcript: \n{transcript}")
 logger.info(f"Cached structured segments: \n{segments}")
 logger.info(f"Transcript hash value: \n{transcript_hash_value}")
+
+ensure_ollama_ready(CFG.ollama_base_url, [CFG.llm_model, CFG.embedding_model])

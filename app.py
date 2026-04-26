@@ -20,7 +20,7 @@ import re
 import subprocess
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
@@ -324,16 +324,31 @@ def convert_to_wav_16k_mono(input_audio: Path, output_wav: Path) -> Path:
 # =============================================================================
 
 @dataclass
-class TranscriptSegment:
-    """One Whisper segment with its start/end timestamps and text.
+class WordTiming:
+    """Word-level timing entry from Whisper's word_timestamps output.
 
-    Supports JSON round-trips via from_dict / to_dict so segments can be
-    written to the transcript cache and restored without losing type info.
+    All fields are optional: older Whisper builds may omit start/end/probability
+    for individual words, so None is an acceptable value in those slots.
+    """
+    word: str
+    start: Optional[float]
+    end: Optional[float]
+    probability: Optional[float]
+
+
+@dataclass
+class TranscriptSegment:
+    """One Whisper segment with its start/end timestamps, text, and word list.
+
+    The words field is populated when word_timestamps=True is set in AppConfig.
+    It defaults to an empty list so code that doesn't need word-level data can
+    ignore it without extra None-checks.
     """
     segment_id: int
     start: float
     end: float
     text: str
+    words: List[WordTiming] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TranscriptSegment":
@@ -342,6 +357,7 @@ class TranscriptSegment:
             start=float(data["start"]),
             end=float(data["end"]),
             text=str(data["text"]),
+            words=[WordTiming(**w) for w in data.get("words", [])],
         )
 
     def to_dict(self) -> Dict[str, Any]:

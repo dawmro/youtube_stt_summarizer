@@ -574,27 +574,63 @@ Answer:""",
 
 
 # =============================================================================
-# TRANSCRIPTION
+# TRANSCRIPT CACHE AND PIPELINE
 # =============================================================================
 
-def transcribe_audio(
-    audio_path: Path, whisper_model: WhisperModel
-) -> Tuple[str, List[TranscriptSegment]]:
-    """Run faster-whisper and return transcript text plus typed segments.
+def transcript_record_path(video_id: str) -> Path:
+    return PATHS.transcript / f"{video_id}__{STT_CONFIG_HASH}.json"
 
-    Each Whisper segment becomes a TranscriptSegment carrying its start/end
-    times.  The plain-text transcript is the segments joined by newlines.
-    """
+
+def load_cached_transcript(
+    video_id: str,
+) -> Optional[Tuple[str, List[TranscriptSegment], str]]:
+    """Load transcript cache when the STT config hash (encoded in filename) matches."""
+    data = read_json(transcript_record_path(video_id))
+    if not data:
+        return None
+    transcript = str(data.get("transcript", "")).strip()
+    raw_segments = data.get("segments")
+    if not transcript or not isinstance(raw_segments, list) or not raw_segments:
+        return None
+    segments = [TranscriptSegment.from_dict(item) for item in raw_segments]
+    transcript_hash_value = data.get("transcript_hash") or text_hash(transcript)
+    return transcript, segments, transcript_hash_value
+
+
+def save_transcript(
+    video_id: str, transcript: str, segments: List[TranscriptSegment]
+) -> None:
+    """Persist transcript text and timestamped segments together."""
+    write_json_atomic(
+        transcript_record_path(video_id),
+        {
+            "video_id": video_id,
+            "transcript": transcript,
+            "transcript_hash": text_hash(transcript),
+            "segments": [seg.to_dict() for seg in segments],
+            "transcript_schema_version": CFG.transcript_schema_version,
+            "stt_config_hash": STT_CONFIG_HASH,
+            "stt_config": current_stt_config(),
+            "saved_at": time.time(),
+        },
+    )
+
+
+def transcribe_audio(
+    audio_path: Path, runtime: RuntimeDeps
+) -> Tuple[str, List[TranscriptSegment]]:
+    """Run faster-whisper and return transcript text plus typed segments."""
     kwargs: Dict[str, Any] = {
         "beam_size": CFG.whisper_beam_size,
         "vad_filter": CFG.whisper_vad_filter,
         "condition_on_previous_text": CFG.whisper_condition_on_previous_text,
+        "word_timestamps": CFG.whisper_word_timestamps,
     }
     if CFG.whisper_language:
         kwargs["language"] = CFG.whisper_language
 
     with log_time("whisper transcription"):
-        segments, info = whisper_model.transcribe(str(audio_path), **kwargs)
+        segments, info = runtime.whisper.transcribe(str(audio_path), **kwargs)
 
     transcript_lines: List[str] = []
     structured_segments: List[TranscriptSegment] = []
@@ -603,14 +639,30 @@ def transcribe_audio(
         text = seg.text.strip()
         if not text:
             continue
-
         transcript_lines.append(text)
+        words: List[WordTiming] = []
+        for word in getattr(seg, "words", None) or []:
+            if getattr(word, "word", None) is None:
+                continue
+            words.append(
+                WordTiming(
+                    word=str(word.word),
+                    start=float(word.start) if word.start is not None else None,
+                    end=float(word.end) if word.end is not None else None,
+                    probability=(
+                        float(word.probability)
+                        if getattr(word, "probability", None) is not None
+                        else None
+                    ),
+                )
+            )
         structured_segments.append(
             TranscriptSegment(
                 segment_id=seg_idx,
                 start=float(seg.start) if seg.start is not None else 0.0,
                 end=float(seg.end) if seg.end is not None else 0.0,
                 text=text,
+                words=words,
             )
         )
 
@@ -629,75 +681,20 @@ def transcribe_audio(
 
 
 # =============================================================================
-# TRANSCRIPT CACHE
-# =============================================================================
-
-def transcript_record_path(video_id: str) -> Path:
-    """Derive the cache file path for a transcript.
-
-    The STT_CONFIG_HASH is embedded in the filename so any change to Whisper
-    settings automatically routes to a new file — no stale cache reads.
-
-    Pattern: <video_id>__<stt_config_hash>.json
-    """
-    return PATHS.transcript / f"{video_id}__{STT_CONFIG_HASH}.json"
-
-
-def save_transcript(
-    video_id: str, transcript: str, segments: List[TranscriptSegment]
-) -> None:
-    """Persist transcript text and timestamped segments together.
-
-    Both are stored in one record so the summary (which needs text) and the
-    retrieval pipeline (which needs segment timestamps) always stay in sync.
-    """
-    write_json_atomic(
-        transcript_record_path(video_id),
-        {
-            "video_id": video_id,
-            "transcript": transcript,
-            "transcript_hash": text_hash(transcript),
-            "segments": [seg.to_dict() for seg in segments],
-            "transcript_schema_version": CFG.transcript_schema_version,
-            "stt_config_hash": STT_CONFIG_HASH,
-            "stt_config": current_stt_config(),
-            "saved_at": time.time(),
-        },
-    )
-
-
-def load_cached_transcript(
-    video_id: str,
-) -> Optional[Tuple[str, List[TranscriptSegment], str]]:
-    """Load a transcript from cache when the STT config hash matches.
-
-    The config hash is already encoded in the filename, so a file that exists
-    at the derived path is guaranteed to match the current settings.  We only
-    validate that the payload is structurally complete (non-empty transcript
-    and at least one segment).
-
-    Returns (transcript_text, segments, transcript_hash) or None on miss.
-    """
-    data = read_json(transcript_record_path(video_id))
-    if not data:
-        return None
-
-    transcript = str(data.get("transcript", "")).strip()
-    raw_segments = data.get("segments")
-    if not transcript or not isinstance(raw_segments, list) or not raw_segments:
-        return None
-
-    segments = [TranscriptSegment.from_dict(item) for item in raw_segments]
-    transcript_hash_value = data.get("transcript_hash") or text_hash(transcript)
-    return transcript, segments, transcript_hash_value
-
-
-# =============================================================================
 # TYPED GENERATOR YIELDS
 # =============================================================================
 
 class SttUpdate(NamedTuple):
-    """Streaming update yielded by fetch_transcript_from_stt_stream."""
+    """Streaming update yielded by fetch_transcript_from_stt_stream.
+
+    Fields:
+        message    — human-readable status line for the UI label.
+        transcript — full transcript string once available; None during early
+                     pipeline stages.
+        segments   — typed List[TranscriptSegment] once Whisper completes;
+                     None during early stages.
+        progress   — integer 0-100 for the progress bar.
+    """
     message: str
     transcript: Optional[str]
     segments: Optional[List[TranscriptSegment]]
@@ -705,11 +702,17 @@ class SttUpdate(NamedTuple):
 
 
 class SummaryUpdate(NamedTuple):
-    """Streaming update yielded by summarize_transcript_stream."""
+    """Streaming update yielded by summarize_transcript_stream.
+
+    Fields:
+        message  — human-readable status line for the UI label.
+        summary  — finished summary text once generated; None during early
+                   stages.
+        progress — integer 0-100 for the progress bar.
+    """
     message: str
     summary: Optional[str]
     progress: int
-
 
 # =============================================================================
 # STT STREAMING PIPELINE
@@ -1977,7 +1980,33 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
     return interface
 
 
+# =============================================================================
+# ENTRYPOINT
+# =============================================================================
 
+def main() -> None:
+    """Application entrypoint.
+
+    Execution order:
+        1. PATHS.ensure()   — create cache directories before any handler runs.
+        2. build_runtime()  — initialize Whisper, Ollama clients, and prompt
+                              chains; blocks until Ollama health check passes.
+        3. build_interface() — construct the Gradio Blocks UI wired to the
+                               runtime-bound handlers.
+        4. .queue()         — enable Gradio's event queue with concurrency
+                              limited to 1 to protect the local Ollama server
+                              from parallel inference requests.
+        5. .launch()        — start the Gradio server; blocks until stopped.
+    """
+    PATHS.ensure()
+    runtime = build_runtime()
+    interface = build_interface(runtime)
+    interface.queue(default_concurrency_limit=1)
+    interface.launch(server_name="localhost", server_port=7860)
+
+
+if __name__ == "__main__":
+    main()
 
 
 video_url = "https://www.youtube.com/watch?v=BSuAgw8Lc1Y"

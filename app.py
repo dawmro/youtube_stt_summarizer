@@ -901,6 +901,72 @@ class RetrievalChunk:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+    
+
+# =============================================================================
+# RETRIEVAL CHUNKING
+# =============================================================================
+
+def build_retrieval_chunks(segments: List[TranscriptSegment]) -> List[RetrievalChunk]:
+    """Group TranscriptSegment objects into RetrievalChunk instances.
+
+    Chunking strategy:
+    - Accumulate segments until the combined text would exceed embed_chunk_size
+      characters (CFG.embed_chunk_size).
+    - After emitting a chunk, step back by embed_chunk_overlap_segments so the
+      next chunk starts overlap-many segments before the current boundary.
+      This prevents context from being silently cut at chunk edges.
+    - Segments whose text is empty or whitespace-only are skipped entirely.
+    - chunk_id values are assigned sequentially starting from 0.
+
+    Returns an empty list when all input segments have empty text.
+    """
+    # Filter out segments with no usable text upfront.
+    valid = [s for s in segments if s.text.strip()]
+    if not valid:
+        return []
+
+    chunks: List[RetrievalChunk] = []
+    chunk_id = 0
+    idx = 0
+
+    while idx < len(valid):
+        window: List[TranscriptSegment] = []
+        char_count = 0
+
+        # Grow the window until the next segment would push us over the budget.
+        j = idx
+        while j < len(valid):
+            seg = valid[j]
+            seg_len = len(seg.text)
+            if window and char_count + seg_len > CFG.embed_chunk_size:
+                break
+            window.append(seg)
+            char_count += seg_len
+            j += 1
+
+        if not window:
+            # Safety: single segment longer than the budget — include it alone.
+            window = [valid[idx]]
+            j = idx + 1
+
+        chunks.append(
+            RetrievalChunk(
+                chunk_id=chunk_id,
+                text=" ".join(s.text for s in window),
+                start=window[0].start,
+                end=window[-1].end,
+                segment_ids=[s.segment_id for s in window],
+            )
+        )
+        chunk_id += 1
+
+        # Slide the window forward, stepping back by the overlap amount so the
+        # next chunk re-uses the last overlap-many segments of this one.
+        advance = max(1, len(window) - CFG.embed_chunk_overlap_segments)
+        idx += advance
+
+    return chunks
 
 
 

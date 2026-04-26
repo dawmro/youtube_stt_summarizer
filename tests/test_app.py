@@ -67,3 +67,41 @@ class TestRequireVideoId:
         result = app.require_video_id("https://youtu.be/abcdefghijk")
         assert result == "abcdefghijk"
 
+# ===========================================================================
+# 2. Time / URL formatting
+# ===========================================================================
+
+class TestSecondsToHhmmss:
+    """seconds_to_hhmmss must format integers and floats correctly."""
+
+    def test_zero(self):
+        assert app.seconds_to_hhmmss(0) == "00:00:00"
+
+    def test_one_minute(self):
+        assert app.seconds_to_hhmmss(60) == "00:01:00"
+
+    def test_one_hour(self):
+        assert app.seconds_to_hhmmss(3600) == "01:00:00"
+
+    def test_mixed(self):
+        assert app.seconds_to_hhmmss(3725) == "01:02:05"
+
+    def test_negative_clamps_to_zero(self):
+        assert app.seconds_to_hhmmss(-5) == "00:00:00"
+
+    def test_float_truncated_not_rounded(self):
+        # 90.9 seconds → 00:01:30  (int() truncates, does not round)
+        assert app.seconds_to_hhmmss(90.9) == "00:01:30"
+
+
+class TestBuildYoutubeTimeUrl:
+    """build_youtube_time_url must produce a well-formed deep-link URL."""
+
+    def test_basic(self):
+        url = app.build_youtube_time_url("abc123", 125.7)
+        assert url == "https://www.youtube.com/watch?v=abc123&t=125s"
+
+    def test_negative_start_clamps_to_zero(self):
+        url = app.build_youtube_time_url("abc123", -10)
+        assert url == "https://www.youtube.com/watch?v=abc123&t=0s"
+

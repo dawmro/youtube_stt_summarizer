@@ -18,10 +18,12 @@ import logging
 import os
 import re
 import subprocess
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Generator, List, Optional
 
 
 # =============================================================================
@@ -188,6 +190,17 @@ RETRIEVAL_CONFIG_HASH = stable_hash_obj(current_retrieval_config())
 # GENERAL UTILS
 # =============================================================================
 
+@contextmanager
+def log_time(label: str) -> Generator[None, None, None]:
+    """Log the execution time of a block."""
+    start = time.perf_counter()
+    logger.info("START: %s", label)
+    try:
+        yield
+    finally:
+        logger.info("END: %s (%.2fs)", label, time.perf_counter() - start)
+
+
 def run_command(cmd: List[str]) -> None:
     """Execute a subprocess command and raise a readable error if it fails."""
     logger.info("Running command: %s", " ".join(cmd))
@@ -307,8 +320,10 @@ source_dir = PATHS.ytdlp / video_id
 audio_dir = PATHS.audio / video_id
 wav_path = audio_dir / "audio.wav"
 
-source_audio = download_audio(video_id, source_dir)
-convert_to_wav_16k_mono(source_audio, wav_path)
+with log_time("Getting source audio"):
+    source_audio = download_audio(video_id, source_dir)
+with log_time("Converting to WAV"):    
+    convert_to_wav_16k_mono(source_audio, wav_path)
 logger.info(build_youtube_time_url(video_id, 245))
 
 logger.info(current_stt_config())

@@ -53,7 +53,6 @@ os.environ["OMP_NUM_THREADS"] = "4"
 # CONFIGURATION
 # =============================================================================
 
-
 @dataclass(frozen=True)
 class AppConfig:
     """Application configuration and cache-version inputs.
@@ -293,76 +292,6 @@ def write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
 
 
 # =============================================================================
-# MODEL INITIALIZATION
-# =============================================================================
-
-def normalize_model_name(name: str) -> str:
-    """Normalize Ollama model names by stripping variant suffixes."""
-    return name.strip().split(":", 1)[0]
-
-
-def ensure_ollama_ready(base_url: str, required_models: Iterable[str], timeout: float = 5.0) -> None:
-    """Fail fast when Ollama is offline or required models are missing.
-
-    Business logic:
-    validating availability during startup avoids wasting time on downloading and
-    transcribing audio before discovering that generation cannot run.
-    """
-    try:
-        response = requests.get(f"{base_url.rstrip('/')}/api/tags", timeout=timeout)
-        response.raise_for_status()
-        data = response.json()
-    except Exception as exc:
-        raise RuntimeError(
-            f"Ollama is not reachable at '{base_url}'. Make sure the server is running."
-        ) from exc
-
-    available_names = {
-        item.get("name").strip()
-        for item in data.get("models", [])
-        if isinstance(item, dict) and item.get("name")
-    }
-    available_base_names = {normalize_model_name(name) for name in available_names}
-
-    missing = [
-        model for model in required_models
-        if model not in available_names and normalize_model_name(model) not in available_base_names
-    ]
-
-    if missing:
-        raise RuntimeError(
-            "Ollama is online, but required models are missing: "
-            f"{', '.join(missing)}. Available: {', '.join(sorted(available_names)) or '(none)'}"
-        )
-    
-
-def warmup_ollama_clients(llm: Ollama, embeddings: OllamaEmbeddings) -> None:
-    """Verify both embeddings and generation paths before the UI starts."""
-    try:
-        vector = embeddings.embed_query("health check")
-        if not vector:
-            raise RuntimeError("Embedding warmup returned an empty vector.")
-    except Exception as exc:
-        raise RuntimeError("Ollama embeddings warmup failed.") from exc
-
-    try:
-        response = llm.invoke("Reply with OK.")
-        if response is None or not str(response).strip():
-            raise RuntimeError("LLM warmup returned an empty response.")
-    except Exception as exc:
-        raise RuntimeError("Ollama LLM warmup failed.") from exc
-    
-
-def make_prompt_chain(llm: Ollama, template: str, input_variables: List[str]) -> LLMChain:
-    """Construct a LangChain prompt chain with consistent wiring."""
-    return LLMChain(
-        llm=llm,
-        prompt=PromptTemplate(template=template, input_variables=input_variables),
-    )
-
-
-
-# =============================================================================
 # AUDIO PIPELINE
 # =============================================================================
 
@@ -444,6 +373,196 @@ class TranscriptSegment:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+    
+
+@dataclass(frozen=True)
+class RuntimeDeps:
+    """Runtime model dependencies and prompt chains."""
+
+    llm: Ollama
+    embeddings: OllamaEmbeddings
+    whisper: WhisperModel
+    summary_chain: LLMChain
+    chunk_summary_chain: LLMChain
+    reduce_summary_chain: LLMChain
+    qa_chain: LLMChain
+
+
+# =============================================================================
+# MODEL INITIALIZATION
+# =============================================================================
+
+def normalize_model_name(name: str) -> str:
+    """Normalize Ollama model names by stripping variant suffixes."""
+    return name.strip().split(":", 1)[0]
+
+
+def ensure_ollama_ready(base_url: str, required_models: Iterable[str], timeout: float = 5.0) -> None:
+    """Fail fast when Ollama is offline or required models are missing.
+
+    Business logic:
+    validating availability during startup avoids wasting time on downloading and
+    transcribing audio before discovering that generation cannot run.
+    """
+    try:
+        response = requests.get(f"{base_url.rstrip('/')}/api/tags", timeout=timeout)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Ollama is not reachable at '{base_url}'. Make sure the server is running."
+        ) from exc
+
+    available_names = {
+        item.get("name").strip()
+        for item in data.get("models", [])
+        if isinstance(item, dict) and item.get("name")
+    }
+    available_base_names = {normalize_model_name(name) for name in available_names}
+
+    missing = [
+        model for model in required_models
+        if model not in available_names and normalize_model_name(model) not in available_base_names
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "Ollama is online, but required models are missing: "
+            f"{', '.join(missing)}. Available: {', '.join(sorted(available_names)) or '(none)'}"
+        )
+    
+
+def warmup_ollama_clients(llm: Ollama, embeddings: OllamaEmbeddings) -> None:
+    """Verify both embeddings and generation paths before the UI starts."""
+    try:
+        vector = embeddings.embed_query("health check")
+        if not vector:
+            raise RuntimeError("Embedding warmup returned an empty vector.")
+    except Exception as exc:
+        raise RuntimeError("Ollama embeddings warmup failed.") from exc
+
+    try:
+        response = llm.invoke("Reply with OK.")
+        if response is None or not str(response).strip():
+            raise RuntimeError("LLM warmup returned an empty response.")
+    except Exception as exc:
+        raise RuntimeError("Ollama LLM warmup failed.") from exc
+    
+
+def make_prompt_chain(llm: Ollama, template: str, input_variables: List[str]) -> LLMChain:
+    """Construct a LangChain prompt chain with consistent wiring."""
+    return LLMChain(
+        llm=llm,
+        prompt=PromptTemplate(template=template, input_variables=input_variables),
+    )
+
+
+def build_runtime() -> RuntimeDeps:
+    """Initialize model clients and prompt chains used by the application."""
+    logger.info("Initializing models at startup...")
+
+    ensure_ollama_ready(CFG.ollama_base_url, [CFG.llm_model, CFG.embedding_model])
+
+    llm = Ollama(
+        model=CFG.llm_model,
+        temperature=0.7,
+        top_p=0.9,
+        base_url=CFG.ollama_base_url,
+    )
+    embeddings = OllamaEmbeddings(
+        model=CFG.embedding_model,
+        base_url=CFG.ollama_base_url,
+    )
+    warmup_ollama_clients(llm, embeddings)
+
+    whisper = WhisperModel(
+        CFG.whisper_model_size,
+        device=CFG.whisper_device,
+        compute_type=CFG.whisper_compute_type,
+    )
+
+    summary_chain = make_prompt_chain(
+        llm,
+        """You are an AI assistant that summarizes YouTube video transcripts.
+
+Instructions:
+- Write a concise but informative summary.
+- Focus only on what is actually said.
+- Ignore timestamps and filler words.
+- Capture important details, numbers, names, and concrete claims.
+- Avoid repetition.
+
+Transcript:
+{transcript}
+
+Summary:""",
+        ["transcript"],
+    )
+    chunk_summary_chain = make_prompt_chain(
+        llm,
+        """You are an AI assistant summarizing one part of a YouTube transcript.
+
+Instructions:
+- Write a dense but compact summary of this chunk.
+- Focus only on what is actually said.
+- Preserve important facts, names, numbers, and claims.
+- Ignore timestamps and filler words.
+- Do not add commentary.
+- Do not repeat obvious context.
+
+Transcript chunk:
+{chunk}
+
+Chunk summary:""",
+        ["chunk"],
+    )
+    reduce_summary_chain = make_prompt_chain(
+        llm,
+        """You are an AI assistant combining partial summaries of a YouTube transcript.
+
+Instructions:
+- Merge these chunk summaries into one coherent final summary.
+- Preserve important facts, names, numbers, and claims.
+- Remove redundancy and repeated points.
+- Keep the result concise but informative.
+- Do not invent anything that is not supported by the summaries.
+
+Chunk summaries:
+{summaries}
+
+Final summary:""",
+        ["summaries"],
+    )
+    qa_chain = make_prompt_chain(
+        llm,
+        """Answer the question using ONLY the context.
+
+Rules:
+- If the answer is not in the context, respond exactly:
+  "I don't have enough information to answer this question."
+- When you use evidence, cite supporting sources inline using source ids, for example [S1] or [S1][S2].
+- Do not invent timestamps or sources.
+- Prefer a concise answer.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:""",
+        ["context", "question"],
+    )
+
+    logger.info("Models initialized successfully")
+    return RuntimeDeps(
+        llm=llm,
+        embeddings=embeddings,
+        whisper=whisper,
+        summary_chain=summary_chain,
+        chunk_summary_chain=chunk_summary_chain,
+        reduce_summary_chain=reduce_summary_chain,
+        qa_chain=qa_chain,
+    )
 
 
 # =============================================================================
@@ -617,78 +736,4 @@ warmup_ollama_clients(llm, embeddings)
 tokens = estimate_tokens(transcript)
 logger.info(f"Estimated tokens: {tokens}")
 
-
-summary_chain = make_prompt_chain(
-    llm,
-    """You are an AI assistant that summarizes YouTube video transcripts.
-
-Instructions:
-- Write a concise but informative summary.
-- Focus only on what is actually said.
-- Ignore timestamps and filler words.
-- Capture important details, numbers, names, and concrete claims.
-- Avoid repetition.
-
-Transcript:
-{transcript}
-
-Summary:""",
-    ["transcript"],
-)
-
-chunk_summary_chain = make_prompt_chain(
-    llm,
-    """You are an AI assistant summarizing one part of a YouTube transcript.
-
-Instructions:
-- Write a dense but compact summary of this chunk.
-- Focus only on what is actually said.
-- Preserve important facts, names, numbers, and claims.
-- Ignore timestamps and filler words.
-- Do not add commentary.
-- Do not repeat obvious context.
-
-Transcript chunk:
-{chunk}
-
-Chunk summary:""",
-    ["chunk"],
-)
-
-reduce_summary_chain = make_prompt_chain(
-    llm,
-    """You are an AI assistant combining partial summaries of a YouTube transcript.
-
-Instructions:
-- Merge these chunk summaries into one coherent final summary.
-- Preserve important facts, names, numbers, and claims.
-- Remove redundancy and repeated points.
-- Keep the result concise but informative.
-- Do not invent anything that is not supported by the summaries.
-
-Chunk summaries:
-{summaries}
-
-Final summary:""",
-    ["summaries"],
-)
-
-qa_chain = make_prompt_chain(
-    llm,
-    """Answer the question using ONLY the context.
-
-Rules:
-- If the answer is not in the context, respond exactly:
-  "I don't have enough information to answer this question."
-- When you use evidence, cite supporting sources inline using source ids, for example [S1] or [S1][S2].
-- Do not invent timestamps or sources.
-- Prefer a concise answer.
-
-Context:
-{context}
-
-Question: {question}
-
-Answer:""",
-        ["context", "question"],
-)
+runtime = build_runtime()

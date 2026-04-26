@@ -28,6 +28,8 @@ from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
 
 import tiktoken
 from faster_whisper import WhisperModel
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_community.llms import Ollama
 
@@ -349,6 +351,16 @@ def warmup_ollama_clients(llm: Ollama, embeddings: OllamaEmbeddings) -> None:
             raise RuntimeError("LLM warmup returned an empty response.")
     except Exception as exc:
         raise RuntimeError("Ollama LLM warmup failed.") from exc
+    
+
+def make_prompt_chain(llm: Ollama, template: str, input_variables: List[str]) -> LLMChain:
+    """Construct a LangChain prompt chain with consistent wiring."""
+    return LLMChain(
+        llm=llm,
+        prompt=PromptTemplate(template=template, input_variables=input_variables),
+    )
+
+
 
 # =============================================================================
 # AUDIO PIPELINE
@@ -604,3 +616,79 @@ warmup_ollama_clients(llm, embeddings)
 
 tokens = estimate_tokens(transcript)
 logger.info(f"Estimated tokens: {tokens}")
+
+
+summary_chain = make_prompt_chain(
+    llm,
+    """You are an AI assistant that summarizes YouTube video transcripts.
+
+Instructions:
+- Write a concise but informative summary.
+- Focus only on what is actually said.
+- Ignore timestamps and filler words.
+- Capture important details, numbers, names, and concrete claims.
+- Avoid repetition.
+
+Transcript:
+{transcript}
+
+Summary:""",
+    ["transcript"],
+)
+
+chunk_summary_chain = make_prompt_chain(
+    llm,
+    """You are an AI assistant summarizing one part of a YouTube transcript.
+
+Instructions:
+- Write a dense but compact summary of this chunk.
+- Focus only on what is actually said.
+- Preserve important facts, names, numbers, and claims.
+- Ignore timestamps and filler words.
+- Do not add commentary.
+- Do not repeat obvious context.
+
+Transcript chunk:
+{chunk}
+
+Chunk summary:""",
+    ["chunk"],
+)
+
+reduce_summary_chain = make_prompt_chain(
+    llm,
+    """You are an AI assistant combining partial summaries of a YouTube transcript.
+
+Instructions:
+- Merge these chunk summaries into one coherent final summary.
+- Preserve important facts, names, numbers, and claims.
+- Remove redundancy and repeated points.
+- Keep the result concise but informative.
+- Do not invent anything that is not supported by the summaries.
+
+Chunk summaries:
+{summaries}
+
+Final summary:""",
+    ["summaries"],
+)
+
+qa_chain = make_prompt_chain(
+    llm,
+    """Answer the question using ONLY the context.
+
+Rules:
+- If the answer is not in the context, respond exactly:
+  "I don't have enough information to answer this question."
+- When you use evidence, cite supporting sources inline using source ids, for example [S1] or [S1][S2].
+- Do not invent timestamps or sources.
+- Prefer a concise answer.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:""",
+        ["context", "question"],
+)

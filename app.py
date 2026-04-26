@@ -25,6 +25,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
 
+from faster_whisper import WhisperModel
+
 
 # =============================================================================
 # LOGGING
@@ -313,6 +315,43 @@ def convert_to_wav_16k_mono(input_audio: Path, output_wav: Path) -> Path:
     return output_wav
 
 
+def transcribe_audio(audio_path: Path, whisper_model: WhisperModel) -> str:
+    """Run faster-whisper and return the transcript as a plain string.
+
+    Whisper yields an iterable of segments; we join their text fields into a
+    single newline-separated string.  Raises RuntimeError if the result is
+    empty so callers never have to handle a silent failure.
+    """
+    kwargs = {
+        "beam_size": CFG.whisper_beam_size,
+        "vad_filter": CFG.whisper_vad_filter,
+        "condition_on_previous_text": CFG.whisper_condition_on_previous_text,
+    }
+    if CFG.whisper_language:
+        kwargs["language"] = CFG.whisper_language
+
+    with log_time("whisper transcription"):
+        segments, info = whisper_model.transcribe(audio = str(audio_path), **kwargs)
+
+    lines: List[str] = []
+    for seg in segments:
+        text = seg.text.strip()
+        if text:
+            lines.append(text)
+
+    transcript = "\n".join(lines).strip()
+    if not transcript:
+        raise RuntimeError("STT returned an empty transcript.")
+
+    logger.info(
+        "Transcription done (language=%s, prob=%.3f, chars=%d)",
+        getattr(info, "language", "unknown"),
+        getattr(info, "language_probability", 0.0),
+        len(transcript),
+    )
+    return transcript
+
+
 video_url = "https://www.youtube.com/watch?v=BSuAgw8Lc1Y"
 video_id = require_video_id(video_url)
 
@@ -326,11 +365,16 @@ with log_time("Converting to WAV"):
     convert_to_wav_16k_mono(source_audio, wav_path)
 logger.info(build_youtube_time_url(video_id, 245))
 
-logger.info(current_stt_config())
 logger.info(STT_CONFIG_HASH)
-
-logger.info(current_summary_config())
 logger.info(SUMMARY_CONFIG_HASH)
-
-logger.info(current_retrieval_config())
 logger.info(RETRIEVAL_CONFIG_HASH)
+
+whisper_model = WhisperModel(
+    CFG.whisper_model_size,
+    device=CFG.whisper_device,
+    compute_type=CFG.whisper_compute_type,
+)
+
+with log_time("Transcribing audio"): 
+    transcript = transcribe_audio(wav_path, whisper_model)
+logger.info(f"Transcript: \n{transcript}")

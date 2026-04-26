@@ -26,6 +26,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Generator, Iterable, List, NamedTuple, Optional, Tuple
 
+import gradio as gr
 import tiktoken
 from faster_whisper import WhisperModel
 from langchain.chains import LLMChain
@@ -1565,6 +1566,154 @@ def render_clickable_answer(
     return rendered
 
 
+# =============================================================================
+# GRADIO HANDLERS
+# =============================================================================
+
+def _make_summarize_handler(runtime: RuntimeDeps):
+    """Factory that closes over runtime and returns the summarize Gradio callback.
+
+    Using a factory keeps the module importable without live model objects:
+    the handler is only constructed inside main(), never at import time.
+
+    The inner generator drives the full transcript → summary pipeline and
+    yields 8 values on every update to match the .click() outputs list:
+        (status, token_info, transcript, summary, stats, stt_progress,
+         summary_progress, state)
+    """
+
+    def summarize_video_gradio(
+        video_url: str,
+        state_payload: Dict[str, Any],
+    ) -> Generator:
+        """Run transcript + summary pipeline and stream UI updates."""
+        state = SessionState.from_gradio(state_payload)
+        started_at = time.perf_counter()
+
+        if not video_url.strip():
+            yield (
+                "❌ Please provide a valid YouTube URL.",
+                "", "", "", "", 0, 0, state.to_gradio(),
+            )
+            return
+
+        try:
+            transcript: Optional[str] = None
+            segments: Optional[List[TranscriptSegment]] = None
+            stt_progress = 0
+            summary_progress = 0
+
+            yield "🚀 Starting pipeline...", "", "", "", "", 0, 0, state.to_gradio()
+
+            # ── STT phase ───────────────────────────────────────────────────
+            for update in fetch_transcript_from_stt_stream(video_url, runtime):
+                stt_progress = update.progress
+                # Keep the most recent non-None values across yields.
+                transcript = update.transcript or transcript
+                segments = update.segments or segments
+                yield (
+                    update.message,
+                    "",
+                    transcript or "",
+                    "",
+                    "",
+                    stt_progress,
+                    summary_progress,
+                    state.to_gradio(),
+                )
+
+            if not transcript or not segments:
+                raise RuntimeError("Transcript fetch failed — no text or segments.")
+
+            state.set_transcript(video_url, transcript, segments)
+
+            # ── Token budget info ────────────────────────────────────────────
+            token_count = estimate_tokens(state.processed_transcript)
+            mode = "direct" if token_count <= CFG.max_transcript_tokens else "chunked"
+            token_info = (
+                f"{token_count} tokens "
+                f"(limit ~{CFG.max_transcript_tokens}) | mode={mode}"
+            )
+            stats_info = (
+                f"chars={len(state.processed_transcript)} "
+                f"| tokens={token_count} "
+                f"| segments={len(state.transcript_segments)}"
+            )
+            summary_progress = 5
+            yield (
+                "🔢 Counting tokens...",
+                token_info,
+                state.processed_transcript,
+                "",
+                stats_info,
+                stt_progress,
+                summary_progress,
+                state.to_gradio(),
+            )
+
+            # ── Summary cache check ──────────────────────────────────────────
+            cached_summary = load_cached_summary(
+                state.video_id, state.transcript_hash, mode
+            )
+            if cached_summary:
+                state.summary = cached_summary
+                elapsed = time.perf_counter() - started_at
+                yield (
+                    f"✅ Done in {elapsed:.2f}s (cached summary).",
+                    token_info,
+                    state.processed_transcript,
+                    state.summary,
+                    stats_info,
+                    100,
+                    100,
+                    state.to_gradio(),
+                )
+                return
+
+            # ── Summary generation ───────────────────────────────────────────
+            for update in summarize_transcript_stream(
+                state.processed_transcript, runtime
+            ):
+                summary_progress = update.progress
+                if update.summary:
+                    state.summary = update.summary
+                yield (
+                    update.message,
+                    token_info,
+                    state.processed_transcript,
+                    state.summary,
+                    stats_info,
+                    stt_progress,
+                    summary_progress,
+                    state.to_gradio(),
+                )
+
+            if not state.summary:
+                raise RuntimeError("Summary generation returned empty output.")
+
+            save_summary(state.video_id, state.transcript_hash, mode, state.summary)
+            elapsed = time.perf_counter() - started_at
+            yield (
+                f"✅ Done in {elapsed:.2f}s.",
+                token_info,
+                state.processed_transcript,
+                state.summary,
+                stats_info,
+                100,
+                100,
+                state.to_gradio(),
+            )
+
+        except Exception as exc:
+            logger.exception("Summarize pipeline error")
+            yield (
+                f"❌ Error: {exc}",
+                "", "", "", "", 0, 0, state.to_gradio(),
+            )
+
+    return summarize_video_gradio
+
+
 
 
 video_url = "https://www.youtube.com/watch?v=BSuAgw8Lc1Y"
@@ -1573,3 +1722,5 @@ runtime = build_runtime()
 
 out = fetch_transcript_from_stt_stream(video_url, runtime)
 logger.info(next(out))
+
+summarize_video_gradio = _make_summarize_handler(runtime)

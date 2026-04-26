@@ -1206,6 +1206,7 @@ class SessionState:
         if not self.processed_transcript:
             return True
         url = video_url.strip()
+        # Empty URL means "use whatever is already in session" — do not refresh.
         if not url:
             return False
         new_id = get_video_id(url)

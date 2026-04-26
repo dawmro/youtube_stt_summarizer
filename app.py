@@ -20,10 +20,10 @@ import re
 import subprocess
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 from faster_whisper import WhisperModel
 
@@ -280,6 +280,10 @@ def write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
     tmp_path.replace(path)
 
 
+# =============================================================================
+# AUDIO PIPELINE
+# =============================================================================
+
 def download_audio(video_url: str, output_dir: Path) -> Path:
     """Download source audio using yt-dlp.
 
@@ -315,14 +319,48 @@ def convert_to_wav_16k_mono(input_audio: Path, output_wav: Path) -> Path:
     return output_wav
 
 
-def transcribe_audio(audio_path: Path, whisper_model: WhisperModel) -> str:
-    """Run faster-whisper and return the transcript as a plain string.
+# =============================================================================
+# DATA MODELS
+# =============================================================================
 
-    Whisper yields an iterable of segments; we join their text fields into a
-    single newline-separated string.  Raises RuntimeError if the result is
-    empty so callers never have to handle a silent failure.
+@dataclass
+class TranscriptSegment:
+    """One Whisper segment with its start/end timestamps and text.
+
+    Supports JSON round-trips via from_dict / to_dict so segments can be
+    written to the transcript cache and restored without losing type info.
     """
-    kwargs = {
+    segment_id: int
+    start: float
+    end: float
+    text: str
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TranscriptSegment":
+        return cls(
+            segment_id=int(data["segment_id"]),
+            start=float(data["start"]),
+            end=float(data["end"]),
+            text=str(data["text"]),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# =============================================================================
+# TRANSCRIPTION
+# =============================================================================
+
+def transcribe_audio(
+    audio_path: Path, whisper_model: WhisperModel
+) -> Tuple[str, List[TranscriptSegment]]:
+    """Run faster-whisper and return transcript text plus typed segments.
+
+    Each Whisper segment becomes a TranscriptSegment carrying its start/end
+    times.  The plain-text transcript is the segments joined by newlines.
+    """
+    kwargs: Dict[str, Any] = {
         "beam_size": CFG.whisper_beam_size,
         "vad_filter": CFG.whisper_vad_filter,
         "condition_on_previous_text": CFG.whisper_condition_on_previous_text,
@@ -331,25 +369,38 @@ def transcribe_audio(audio_path: Path, whisper_model: WhisperModel) -> str:
         kwargs["language"] = CFG.whisper_language
 
     with log_time("whisper transcription"):
-        segments, info = whisper_model.transcribe(audio = str(audio_path), **kwargs)
+        segments, info = whisper_model.transcribe(str(audio_path), **kwargs)
 
-    lines: List[str] = []
-    for seg in segments:
+    transcript_lines: List[str] = []
+    structured_segments: List[TranscriptSegment] = []
+
+    for seg_idx, seg in enumerate(segments):
         text = seg.text.strip()
-        if text:
-            lines.append(text)
+        if not text:
+            continue
 
-    transcript = "\n".join(lines).strip()
+        transcript_lines.append(text)
+        structured_segments.append(
+            TranscriptSegment(
+                segment_id=seg_idx,
+                start=float(seg.start) if seg.start is not None else 0.0,
+                end=float(seg.end) if seg.end is not None else 0.0,
+                text=text,
+            )
+        )
+
+    transcript = "\n".join(transcript_lines).strip()
     if not transcript:
         raise RuntimeError("STT returned an empty transcript.")
 
     logger.info(
-        "Transcription done (language=%s, prob=%.3f, chars=%d)",
+        "Transcription done (language=%s, prob=%.3f, chars=%d, segments=%d)",
         getattr(info, "language", "unknown"),
         getattr(info, "language_probability", 0.0),
         len(transcript),
+        len(structured_segments),
     )
-    return transcript
+    return transcript, structured_segments
 
 
 video_url = "https://www.youtube.com/watch?v=BSuAgw8Lc1Y"
@@ -376,5 +427,6 @@ whisper_model = WhisperModel(
 )
 
 with log_time("Transcribing audio"): 
-    transcript = transcribe_audio(wav_path, whisper_model)
+    transcript, structured_segments = transcribe_audio(wav_path, whisper_model)
 logger.info(f"Transcript: \n{transcript}")
+logger.info(f"Structured Segments: \n{structured_segments}")

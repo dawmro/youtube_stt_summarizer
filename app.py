@@ -246,6 +246,25 @@ def require_video_id(video_url: str) -> str:
     return video_id
 
 
+def read_json(path: Path) -> Optional[Dict[str, Any]]:
+    """Read JSON safely and return None on missing or invalid files."""
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("Failed to read JSON cache: %s", path, exc_info=True)
+        return None
+
+
+def write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
+    """Write JSON atomically to avoid partially written cache records."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
 def download_audio(video_url: str, output_dir: Path) -> Path:
     """Download source audio using yt-dlp.
 

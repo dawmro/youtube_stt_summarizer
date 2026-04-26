@@ -1168,6 +1168,55 @@ def get_or_create_faiss(state: SessionState, runtime: RuntimeDeps) -> FAISS:
     logger.info("FAISS index built and persisted to retrieval cache.")
     return faiss_index
 
+# =============================================================================
+# Q&A CONTEXT BUILDER
+# =============================================================================
+
+def build_context_with_sources(
+    docs: List[Any], video_id: str
+) -> Tuple[str, Dict[str, SourceRef]]:
+    """Convert FAISS-retrieved documents into a labelled context string.
+
+    Each document is assigned a sequential label S1, S2, S3 … that the LLM
+    can cite inline in its answer.  A parallel lookup dict maps every label to
+    a SourceRef so the citation renderer can replace [S1] with a formatted
+    Markdown link without doing any additional lookups.
+
+    Returns:
+        context     — multi-line string with labelled passages, ready to be
+                      inserted into the QA prompt's {context} slot.
+        source_lookup — {label: SourceRef} for every document in docs.
+    """
+    if not docs:
+        return "", {}
+
+    context_parts: List[str] = []
+    source_lookup: Dict[str, SourceRef] = {}
+
+    for idx, doc in enumerate(docs, start=1):
+        label = f"S{idx}"
+        meta = doc.metadata
+        start = float(meta.get("start", 0.0))
+        end = float(meta.get("end", 0.0))
+        chunk_id = meta.get("chunk_id")
+        text = doc.page_content
+
+        time_label = f"{seconds_to_hhmmss(start)} - {seconds_to_hhmmss(end)}"
+        url = build_youtube_time_url(video_id, start)
+
+        source_lookup[label] = SourceRef(
+            start=start,
+            end=end,
+            label=time_label,
+            url=url,
+            chunk_id=chunk_id,
+            text=text,
+        )
+        context_parts.append(f"[{label}] {text}")
+
+    context = "\n\n".join(context_parts)
+    return context, source_lookup
+
 
 
 

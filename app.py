@@ -1000,15 +1000,43 @@ class SourceRef:
 
 
 # =============================================================================
-# SESSION STATE  (minimal)
+# SESSION STATE
 # =============================================================================
 
 @dataclass
 class SessionState:
-    """Per-user session container for transcript and retrieval state."""
+    """Per-user in-memory session holding the active transcript and derived state.
+
+    All fields default to safe empty values so a freshly constructed instance
+    represents the "nothing loaded yet" state without any conditional checks.
+
+    Transcript fields:
+        video_url            — original URL submitted by the user.
+        video_id             — extracted 11-char YouTube video id.
+        processed_transcript — full transcript text as a single string.
+        transcript_hash      — short SHA-256 of the transcript, used as a
+                               component of cache file names.
+        transcript_segments  — ordered List[TranscriptSegment] with per-segment
+                               start/end timestamps and optional word timings.
+
+    Derived fields (cleared by reset_derived when a new transcript is loaded):
+        summary       — the most recently generated summary text.
+        last_question — the last question the user asked.
+        last_answer   — the rendered Markdown answer to last_question.
+        chunks        — List[RetrievalChunk] built from transcript_segments.
+        faiss_index   — FAISS vector store built from chunks.
+    """
+    # --- transcript fields ---
+    video_url: str = ""
     video_id: str = ""
+    processed_transcript: str = ""
     transcript_hash: str = ""
     transcript_segments: List[TranscriptSegment] = field(default_factory=list)
+
+    # --- derived fields (cleared when transcript changes) ---
+    summary: str = ""
+    last_question: str = ""
+    last_answer: str = ""
     chunks: Optional[List[RetrievalChunk]] = None
     faiss_index: Optional[Any] = None
 

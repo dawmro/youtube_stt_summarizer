@@ -1,3 +1,18 @@
+"""
+[WIP] YouTube STT Summarizer & Timestamp-Aware Q&A Tool
+
+Business goal:
+- Download audio from a YouTube video.
+- Transcribe it locally with faster-whisper.
+- Cache transcript and retrieval artifacts so repeated runs stay fast.
+- Summarize the transcript with Ollama.
+- Answer questions from the transcript with FAISS retrieval.
+- Render clickable YouTube timestamp links in Q&A answers.
+"""
+
+
+
+
 import logging
 import os
 import re
@@ -79,8 +94,36 @@ class AppConfig:
         return self.max_transcript_tokens // 2
     
 
-CFG = AppConfig()
+@dataclass(frozen=True)
+class CachePaths:
+    """Resolved on-disk cache locations for the application."""
 
+    root: Path
+    ytdlp: Path
+    audio: Path
+    transcript: Path
+    summary: Path
+    retrieval: Path
+
+    @classmethod
+    def from_base_dir(cls, base_dir: Path) -> "CachePaths":
+        cache_root = base_dir / "cache"
+        return cls(
+            root=cache_root,
+            ytdlp=cache_root / "yt_dlp_cache",
+            audio=cache_root / "audio_cache",
+            transcript=cache_root / "transcript_cache",
+            summary=cache_root / "summary_cache",
+            retrieval=cache_root / "retrieval_cache",
+        )
+
+    def ensure(self) -> None:
+        for path in (self.root, self.ytdlp, self.audio, self.transcript, self.summary, self.retrieval):
+            path.mkdir(parents=True, exist_ok=True)
+
+
+CFG = AppConfig()
+PATHS = CachePaths.from_base_dir(CFG.base_dir)
 
 # =============================================================================
 # GENERAL UTILS
@@ -178,11 +221,14 @@ def convert_to_wav_16k_mono(input_audio: Path, output_wav: Path) -> Path:
     )
     return output_wav
 
-video_url = "https://www.youtube.com/watch?v=BSuAgw8Lc1Y"
-source_dir = Path("./cache/yt_dlp_cache")
-wav_path = Path("./cache/audio_cache/audio.wav")
 
+video_url = "https://www.youtube.com/watch?v=BSuAgw8Lc1Y"
 video_id = require_video_id(video_url)
+
+source_dir = PATHS.ytdlp / video_id
+audio_dir = PATHS.audio / video_id
+wav_path = audio_dir / "audio.wav"
+
 source_audio = download_audio(video_id, source_dir)
 convert_to_wav_16k_mono(source_audio, wav_path)
 logger.info(build_youtube_time_url(video_id, 245))

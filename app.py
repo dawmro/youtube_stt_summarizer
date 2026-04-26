@@ -584,12 +584,9 @@ def transcript_record_path(video_id: str) -> Path:
 def load_cached_transcript(
     video_id: str,
 ) -> Optional[Tuple[str, List[TranscriptSegment], str]]:
-    """Load transcript cache when the STT config hash matches."""
+    """Load transcript cache when the STT config hash (encoded in filename) matches."""
     data = read_json(transcript_record_path(video_id))
     if not data:
-        return None
-    if data.get("stt_config_hash") != STT_CONFIG_HASH:
-        logger.info("Transcript cache STT config hash mismatch — discarding.")
         return None
     transcript = str(data.get("transcript", "")).strip()
     raw_segments = data.get("segments")
@@ -973,15 +970,16 @@ def save_summary(
 def load_cached_summary(
     video_id: str, transcript_hash_value: str, mode: str
 ) -> Optional[str]:
-    """Load summary cache when the summary config hash and transcript hash match.
+    """Load summary cache when the filename (config + transcript hash) matches.
 
-    Returns the summary string or None on a cache miss or config mismatch.
+    No redundant in-body hash checks: the filename already encodes the full
+    cache key so a file that exists at the derived path is guaranteed to match
+    the current settings and transcript content.
+
+    Returns the summary string or None on a cache miss.
     """
     data = read_json(summary_record_path(video_id, transcript_hash_value, mode))
     if not data:
-        return None
-    if data.get("summary_config_hash") != SUMMARY_CONFIG_HASH:
-        logger.info("Summary cache config hash mismatch — discarding.")
         return None
     summary = str(data.get("summary", "")).strip()
     return summary or None

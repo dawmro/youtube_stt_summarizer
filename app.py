@@ -419,6 +419,70 @@ def transcribe_audio(
     return transcript, structured_segments
 
 
+# =============================================================================
+# TRANSCRIPT CACHE
+# =============================================================================
+
+def transcript_record_path(video_id: str) -> Path:
+    """Derive the cache file path for a transcript.
+
+    The STT_CONFIG_HASH is embedded in the filename so any change to Whisper
+    settings automatically routes to a new file — no stale cache reads.
+
+    Pattern: <video_id>__<stt_config_hash>.json
+    """
+    return PATHS.transcript / f"{video_id}__{STT_CONFIG_HASH}.json"
+
+
+def save_transcript(
+    video_id: str, transcript: str, segments: List[TranscriptSegment]
+) -> None:
+    """Persist transcript text and timestamped segments together.
+
+    Both are stored in one record so the summary (which needs text) and the
+    retrieval pipeline (which needs segment timestamps) always stay in sync.
+    """
+    write_json_atomic(
+        transcript_record_path(video_id),
+        {
+            "video_id": video_id,
+            "transcript": transcript,
+            "transcript_hash": text_hash(transcript),
+            "segments": [seg.to_dict() for seg in segments],
+            "transcript_schema_version": CFG.transcript_schema_version,
+            "stt_config_hash": STT_CONFIG_HASH,
+            "stt_config": current_stt_config(),
+            "saved_at": time.time(),
+        },
+    )
+
+
+def load_cached_transcript(
+    video_id: str,
+) -> Optional[Tuple[str, List[TranscriptSegment], str]]:
+    """Load a transcript from cache when the STT config hash matches.
+
+    The config hash is already encoded in the filename, so a file that exists
+    at the derived path is guaranteed to match the current settings.  We only
+    validate that the payload is structurally complete (non-empty transcript
+    and at least one segment).
+
+    Returns (transcript_text, segments, transcript_hash) or None on miss.
+    """
+    data = read_json(transcript_record_path(video_id))
+    if not data:
+        return None
+
+    transcript = str(data.get("transcript", "")).strip()
+    raw_segments = data.get("segments")
+    if not transcript or not isinstance(raw_segments, list) or not raw_segments:
+        return None
+
+    segments = [TranscriptSegment.from_dict(item) for item in raw_segments]
+    transcript_hash_value = data.get("transcript_hash") or text_hash(transcript)
+    return transcript, segments, transcript_hash_value
+
+
 video_url = "https://www.youtube.com/watch?v=BSuAgw8Lc1Y"
 video_id = require_video_id(video_url)
 
@@ -443,6 +507,12 @@ whisper_model = WhisperModel(
 )
 
 with log_time("Transcribing audio"): 
-    transcript, structured_segments = transcribe_audio(wav_path, whisper_model)
+    transcript, segments = transcribe_audio(wav_path, whisper_model)
 logger.info(f"Transcript: \n{transcript}")
-logger.info(f"Structured Segments: \n{structured_segments}")
+logger.info(f"Structured Segments: \n{segments}")
+save_transcript(video_id, transcript, segments)
+cached = load_cached_transcript(video_id)
+transcript, segments, transcript_hash_value = cached
+logger.info(f"Cached transcript: \n{transcript}")
+logger.info(f"Cached structured segments: \n{segments}")
+logger.info(f"Transcript hash value: \n{transcript_hash_value}")

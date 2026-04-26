@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
 
 from faster_whisper import WhisperModel
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_community.llms import Ollama
 
 
 # =============================================================================
@@ -325,6 +327,22 @@ def ensure_ollama_ready(base_url: str, required_models: Iterable[str], timeout: 
         )
     
 
+def warmup_ollama_clients(llm: Ollama, embeddings: OllamaEmbeddings) -> None:
+    """Verify both embeddings and generation paths before the UI starts."""
+    try:
+        vector = embeddings.embed_query("health check")
+        if not vector:
+            raise RuntimeError("Embedding warmup returned an empty vector.")
+    except Exception as exc:
+        raise RuntimeError("Ollama embeddings warmup failed.") from exc
+
+    try:
+        response = llm.invoke("Reply with OK.")
+        if response is None or not str(response).strip():
+            raise RuntimeError("LLM warmup returned an empty response.")
+    except Exception as exc:
+        raise RuntimeError("Ollama LLM warmup failed.") from exc
+
 # =============================================================================
 # AUDIO PIPELINE
 # =============================================================================
@@ -564,3 +582,15 @@ logger.info(f"Cached structured segments: \n{segments}")
 logger.info(f"Transcript hash value: \n{transcript_hash_value}")
 
 ensure_ollama_ready(CFG.ollama_base_url, [CFG.llm_model, CFG.embedding_model])
+
+llm = Ollama(
+    model=CFG.llm_model,
+    temperature=0.7,
+    top_p=0.9,
+    base_url=CFG.ollama_base_url,
+)
+embeddings = OllamaEmbeddings(
+    model=CFG.embedding_model,
+    base_url=CFG.ollama_base_url,
+)
+warmup_ollama_clients(llm, embeddings)

@@ -1010,7 +1010,7 @@ class SessionState:
     All fields default to safe empty values so a freshly constructed instance
     represents the "nothing loaded yet" state without any conditional checks.
 
-    Transcript fields:
+    Transcript fields (populated atomically by set_transcript):
         video_url            — original URL submitted by the user.
         video_id             — extracted 11-char YouTube video id.
         processed_transcript — full transcript text as a single string.
@@ -1039,6 +1039,68 @@ class SessionState:
     last_answer: str = ""
     chunks: Optional[List[RetrievalChunk]] = None
     faiss_index: Optional[Any] = None
+
+    # ------------------------------------------------------------------ #
+    # Mutation helpers                                                   #
+    # ------------------------------------------------------------------ #
+
+    def reset_derived(self) -> None:
+        """Clear every field that is derived from the transcript.
+
+        Called by set_transcript whenever a new video is loaded so that the
+        summary, Q&A history, and retrieval index from the previous session are
+        never accidentally served for a different video.
+        """
+        self.summary = ""
+        self.last_question = ""
+        self.last_answer = ""
+        self.chunks = None
+        self.faiss_index = None
+
+    def set_transcript(
+        self,
+        video_url: str,
+        transcript: str,
+        segments: List["TranscriptSegment"],
+    ) -> None:
+        """Atomically update all transcript-derived fields for a new video.
+
+        Computes the transcript hash from the text content so the value stays
+        consistent whether the transcript came from cache or a fresh Whisper
+        run.  Clears derived state immediately after updating the core fields
+        so there is no window where old chunks or a stale FAISS index could
+        be read against the new transcript.
+        """
+        self.video_url = video_url.strip()
+        self.video_id = require_video_id(video_url)
+        self.processed_transcript = transcript
+        self.transcript_hash = text_hash(transcript)
+        self.transcript_segments = list(segments)
+        self.reset_derived()
+
+    # ------------------------------------------------------------------ #
+    # Read-only query helpers                                            #
+    # ------------------------------------------------------------------ #
+
+    def needs_transcript_refresh(self, video_url: str) -> bool:
+        """Decide whether the session must (re-)fetch the transcript.
+
+        Decision table:
+            - No transcript loaded yet          → True  (never been processed)
+            - Empty / blank URL submitted        → False (reuse current session)
+            - Same video id as the current one   → False (already loaded)
+            - Different video id                 → True  (new video)
+
+        This is the single authoritative gate checked by the Gradio handler
+        before kicking off the download + transcription pipeline.
+        """
+        if not self.processed_transcript:
+            return True
+        url = video_url.strip()
+        if not url:
+            return False
+        new_id = get_video_id(url)
+        return new_id != self.video_id
 
 # =============================================================================
 # RETRIEVAL CACHE  (chunks JSON + FAISS index on disk)

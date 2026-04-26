@@ -142,6 +142,48 @@ def text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+def current_stt_config() -> Dict[str, Any]:
+    return {
+        "whisper_model_size": CFG.whisper_model_size,
+        "whisper_device": CFG.whisper_device,
+        "whisper_compute_type": CFG.whisper_compute_type,
+        "language": CFG.whisper_language,
+        "beam_size": CFG.whisper_beam_size,
+        "vad_filter": CFG.whisper_vad_filter,
+        "condition_on_previous_text": CFG.whisper_condition_on_previous_text,
+        "word_timestamps": CFG.whisper_word_timestamps,
+        "transcript_schema_version": CFG.transcript_schema_version,
+    }
+
+
+def current_summary_config() -> Dict[str, Any]:
+    return {
+        "llm_model": CFG.llm_model,
+        "llm_context_limit": CFG.llm_context_limit,
+        "safety_margin": CFG.safety_margin,
+        "max_transcript_tokens": CFG.max_transcript_tokens,
+        "summary_target_tokens": CFG.summary_target_tokens,
+        "summary_chunk_overlap_tokens": CFG.summary_chunk_overlap_tokens,
+        "summary_prompt_version": CFG.summary_prompt_version,
+    }
+
+
+def current_retrieval_config() -> Dict[str, Any]:
+    return {
+        "embedding_model": CFG.embedding_model,
+        "embed_chunk_size": CFG.embed_chunk_size,
+        "embed_chunk_overlap_segments": CFG.embed_chunk_overlap_segments,
+        "retrieval_prompt_version": CFG.retrieval_prompt_version,
+        "retrieval_schema_version": CFG.retrieval_schema_version,
+        "retrieval_top_k": CFG.retrieval_top_k,
+    }
+
+
+STT_CONFIG_HASH = stable_hash_obj(current_stt_config())
+SUMMARY_CONFIG_HASH = stable_hash_obj(current_summary_config())
+RETRIEVAL_CONFIG_HASH = stable_hash_obj(current_retrieval_config())
+
+
 # =============================================================================
 # GENERAL UTILS
 # =============================================================================
@@ -250,3 +292,11 @@ source_audio = download_audio(video_id, source_dir)
 convert_to_wav_16k_mono(source_audio, wav_path)
 logger.info(build_youtube_time_url(video_id, 245))
 
+logger.info(current_stt_config())
+logger.info(STT_CONFIG_HASH)
+
+logger.info(current_summary_config())
+logger.info(SUMMARY_CONFIG_HASH)
+
+logger.info(current_retrieval_config())
+logger.info(RETRIEVAL_CONFIG_HASH)

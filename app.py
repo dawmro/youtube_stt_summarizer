@@ -1520,7 +1520,8 @@ def render_clickable_answer(
     the correct timestamp.  A deduplicated **References** section is appended
     listing every source the LLM actually cited.
 
-    Deduplication uses a list + "if x not in seen" membership check.
+    Deduplication uses dict.fromkeys for O(n) order-preserving uniqueness —
+    faster than the O(n²) "if x not in seen" pattern for long answers.
     """
 
     rendered = raw_answer
@@ -1554,13 +1555,10 @@ def render_clickable_answer(
     rendered = SOURCE_SINGLE_PATTERN.sub(_replace_single, rendered)
 
     # Append a deduplicated References section for every cited source.
-    seen_order: List[str] = []
-    for lbl in used_labels:
-        if lbl not in seen_order:
-            seen_order.append(lbl)
+    seen = dict.fromkeys(used_labels)  # preserves first-seen order, O(n)
     cited_refs = [
         (lbl, source_lookup[lbl])
-        for lbl in seen_order
+        for lbl in seen
         if lbl in source_lookup
     ]
 

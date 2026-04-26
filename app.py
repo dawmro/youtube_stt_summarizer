@@ -1837,13 +1837,148 @@ def _make_qa_handler(runtime: RuntimeDeps):
     return answer_question_gradio
 
 
+# =============================================================================
+# GRADIO INTERFACE
+# =============================================================================
+
+def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
+    """Assemble the Gradio Blocks UI and wire button click events.
+
+    Layout:
+        Tab 1 — Summarize
+            Row:   YouTube URL input  |  Summarize button
+            Label: status
+            Row:   STT progress slider  |  Summary progress slider
+            Text:  token info
+            Text:  transcript stats
+            Row:   Transcript textarea  |  Summary textarea
+
+        Tab 2 — Q&A
+            Row:   YouTube URL input (blank = reuse session)
+            Text:  question input
+            Row:   Ask button
+            Label: status
+            Slider: progress
+            Markdown: answer (supports clickable timestamp links)
+
+    A hidden gr.State component carries the SessionState payload between
+    handler calls.  Both handlers receive it as their last input and emit
+    an updated payload as their last output.
+    """
+    summarize_handler = _make_summarize_handler(runtime)
+    qa_handler = _make_qa_handler(runtime)
+
+    with gr.Blocks(title="YouTube STT Summarizer & Q&A") as interface:
+        session_state = gr.State(value={})
+
+        gr.Markdown("# 🎥 YouTube STT Summarizer & Timestamp-Aware Q&A")
+        gr.Markdown(
+            "Transcribe any YouTube video locally with Whisper, summarize it "
+            "with a local LLM, and ask timestamp-aware questions."
+        )
+
+        with gr.Tabs():
+
+            # ── Tab 1: Summarize ─────────────────────────────────────────────
+            with gr.TabItem("📝 Summarize"):
+
+                with gr.Row():
+                    video_url_sum = gr.Textbox(
+                        label="YouTube URL",
+                        placeholder="https://www.youtube.com/watch?v=...",
+                        scale=5,
+                    )
+                    summarize_btn = gr.Button(
+                        "▶ Summarize", variant="primary", scale=1
+                    )
+
+                status_sum = gr.Label(label="Status")
+
+                with gr.Row():
+                    stt_progress = gr.Slider(
+                        label="STT Progress",
+                        minimum=0, maximum=100, value=0,
+                        interactive=False,
+                    )
+                    summary_progress = gr.Slider(
+                        label="Summary Progress",
+                        minimum=0, maximum=100, value=0,
+                        interactive=False,
+                    )
+
+                token_info = gr.Textbox(label="Token Info", interactive=False)
+                stats_info = gr.Textbox(
+                    label="Transcript Stats", interactive=False
+                )
+
+                with gr.Row():
+                    transcript_out = gr.Textbox(
+                        label="Transcript",
+                        lines=15,
+                        interactive=False,
+                    )
+                    summary_out = gr.Textbox(
+                        label="Summary",
+                        lines=15,
+                        interactive=False,
+                    )
+
+                summarize_btn.click(
+                    fn=summarize_handler,
+                    inputs=[video_url_sum, session_state],
+                    outputs=[
+                        status_sum,
+                        token_info,
+                        transcript_out,
+                        summary_out,
+                        stats_info,
+                        stt_progress,
+                        summary_progress,
+                        session_state,
+                    ],
+                )
+
+            # ── Tab 2: Q&A ───────────────────────────────────────────────────
+            with gr.TabItem("❓ Q&A"):
+
+                with gr.Row():
+                    video_url_qa = gr.Textbox(
+                        label="YouTube URL (leave blank to reuse current session)",
+                        placeholder=(
+                            "https://www.youtube.com/watch?v=...  "
+                            "or leave blank to reuse the Summarize session"
+                        ),
+                        scale=5,
+                    )
+
+                question_input = gr.Textbox(
+                    label="Your Question",
+                    placeholder="What does the speaker say about...?",
+                    lines=2,
+                )
+
+                with gr.Row():
+                    ask_btn = gr.Button("🔎 Ask", variant="primary")
+
+                status_qa = gr.Label(label="Status")
+                qa_progress = gr.Slider(
+                    label="Progress",
+                    minimum=0, maximum=100, value=0,
+                    interactive=False,
+                )
+                answer_out = gr.Markdown(label="Answer")
+
+                ask_btn.click(
+                    fn=qa_handler,
+                    inputs=[video_url_qa, question_input, session_state],
+                    outputs=[status_qa, answer_out, qa_progress, session_state],
+                )
+
+    return interface
+
+
+
 
 
 video_url = "https://www.youtube.com/watch?v=BSuAgw8Lc1Y"
 
-runtime = build_runtime()
-
-out = fetch_transcript_from_stt_stream(video_url, runtime)
-logger.info(next(out))
-
-summarize_video_gradio = _make_summarize_handler(runtime)

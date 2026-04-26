@@ -1041,7 +1041,7 @@ class SessionState:
     faiss_index: Optional[Any] = None
 
     # ------------------------------------------------------------------ #
-    # Mutation helpers                                                   #
+    # Mutation helpers                                                     #
     # ------------------------------------------------------------------ #
 
     def reset_derived(self) -> None:
@@ -1079,7 +1079,7 @@ class SessionState:
         self.reset_derived()
 
     # ------------------------------------------------------------------ #
-    # Read-only query helpers                                            #
+    # Read-only query helpers                                              #
     # ------------------------------------------------------------------ #
 
     def needs_transcript_refresh(self, video_url: str) -> bool:
@@ -1101,6 +1101,85 @@ class SessionState:
             return False
         new_id = get_video_id(url)
         return new_id != self.video_id
+
+    # ------------------------------------------------------------------ #
+    # Gradio serialization                                                 #
+    # ------------------------------------------------------------------ #
+
+    def to_gradio(self) -> Dict[str, Any]:
+        """Serialise session state to a plain dict suitable for gr.State.
+
+        All scalar fields are stored as-is.  TranscriptSegment and
+        RetrievalChunk lists are converted through their to_dict() methods so
+        the payload is fully JSON-serialisable — except for faiss_index, which
+        is kept as a live Python object reference.  FAISS indices cannot be
+        trivially serialised and Gradio state lives in-process memory anyway,
+        so passing the object directly avoids a double round-trip through disk.
+        """
+        return {
+            "video_url": self.video_url,
+            "video_id": self.video_id,
+            "processed_transcript": self.processed_transcript,
+            "transcript_hash": self.transcript_hash,
+            "transcript_segments": [s.to_dict() for s in self.transcript_segments],
+            "summary": self.summary,
+            "last_question": self.last_question,
+            "last_answer": self.last_answer,
+            "chunks": (
+                [c.to_dict() for c in self.chunks]
+                if self.chunks is not None
+                else None
+            ),
+            # Kept by reference — not serialised to JSON.
+            "faiss_index": self.faiss_index,
+        }
+
+    @classmethod
+    def from_gradio(cls, payload: Dict[str, Any]) -> "SessionState":
+        """Reconstruct a SessionState from a to_gradio() payload.
+
+        Uses empty defaults for every key so a partial or missing payload
+        (e.g. the very first render before any video has been processed)
+        never raises a KeyError or TypeError.
+
+        TranscriptSegment and RetrievalChunk lists are rebuilt through their
+        from_dict() class methods; entries that are not dicts are silently
+        skipped so a single corrupted record does not destroy the whole session.
+
+        The faiss_index value is passed through unchanged — it is either a
+        live FAISS object (stored by reference in to_gradio) or None.
+        """
+        if not payload:
+            return cls()
+
+        raw_segments = payload.get("transcript_segments") or []
+        raw_chunks = payload.get("chunks")
+
+        return cls(
+            video_url=str(payload.get("video_url", "")),
+            video_id=str(payload.get("video_id", "")),
+            processed_transcript=str(payload.get("processed_transcript", "")),
+            transcript_hash=str(payload.get("transcript_hash", "")),
+            transcript_segments=[
+                TranscriptSegment.from_dict(s)
+                for s in raw_segments
+                if isinstance(s, dict)
+            ],
+            summary=str(payload.get("summary", "")),
+            last_question=str(payload.get("last_question", "")),
+            last_answer=str(payload.get("last_answer", "")),
+            chunks=(
+                [
+                    RetrievalChunk.from_dict(c)
+                    for c in raw_chunks
+                    if isinstance(c, dict)
+                ]
+                if isinstance(raw_chunks, list)
+                else None
+            ),
+            # Live object or None — passed through from to_gradio().
+            faiss_index=payload.get("faiss_index"),
+        )
 
 # =============================================================================
 # RETRIEVAL CACHE  (chunks JSON + FAISS index on disk)

@@ -770,7 +770,7 @@ def fetch_transcript_from_stt_stream(
         segments=None,
         progress=10,
     )
-    audio_dir = PATHS.audio / video_id
+    audio_dir = PATHS.ytdlp / video_id
     with log_time("yt-dlp download"):
         raw_audio = download_audio(video_url, audio_dir)
     logger.info("Downloaded audio: %s", raw_audio)
@@ -782,7 +782,7 @@ def fetch_transcript_from_stt_stream(
         segments=None,
         progress=30,
     )
-    wav_path = audio_dir / "audio.wav"
+    wav_path = PATHS.audio / video_id / "audio.wav"
     with log_time("ffmpeg convert"):
         convert_to_wav_16k_mono(raw_audio, wav_path)
 

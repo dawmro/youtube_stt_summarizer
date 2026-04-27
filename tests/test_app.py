@@ -274,3 +274,92 @@ class TestBuildRetrievalChunks:
         # At least the first chunk should span 10.0 → 20.0 (or 15.0 depending on chunk size)
         assert chunks[0].start == 10.0
 
+
+# ===========================================================================
+# 6. Q&A rendering: build_context_with_sources + render_clickable_answer
+# ===========================================================================
+
+def _make_doc(start: float, end: float, text: str, chunk_id: int = 0) -> MagicMock:
+    doc = MagicMock()
+    doc.metadata = {"start": start, "end": end, "chunk_id": chunk_id}
+    doc.page_content = text
+    return doc
+
+
+class TestBuildContextWithSources:
+    def test_builds_source_lookup(self):
+        docs = [_make_doc(0.0, 10.0, "First chunk"), _make_doc(60.0, 70.0, "Second chunk")]
+        context, lookup = app.build_context_with_sources(docs, "vid123")
+        assert "S1" in lookup
+        assert "S2" in lookup
+        assert lookup["S1"].start == 0.0
+        assert lookup["S2"].start == 60.0
+
+    def test_context_contains_source_ids_and_text(self):
+        docs = [_make_doc(0.0, 5.0, "Some speech here")]
+        context, _ = app.build_context_with_sources(docs, "vid123")
+        assert "S1" in context
+        assert "Some speech here" in context
+
+    def test_url_contains_video_id(self):
+        docs = [_make_doc(30.0, 40.0, "text")]
+        _, lookup = app.build_context_with_sources(docs, "myVideo")
+        assert "myVideo" in lookup["S1"].url
+
+    def test_url_encodes_start_time(self):
+        docs = [_make_doc(125.0, 135.0, "text")]
+        _, lookup = app.build_context_with_sources(docs, "myVideo")
+        assert "t=125s" in lookup["S1"].url
+
+    def test_empty_docs_returns_empty_context(self):
+        context, lookup = app.build_context_with_sources([], "vid")
+        assert context == ""
+        assert lookup == {}
+
+
+class TestRenderClickableAnswer:
+    def _make_lookup(self):
+        return {
+            "S1": app.SourceRef(start=60.0, end=90.0, label="00:01:00 - 00:01:30",
+                                url="https://youtube.com/watch?v=x&t=60s", chunk_id=0, text="First chunk text"),
+            "S2": app.SourceRef(start=120.0, end=150.0, label="00:02:00 - 00:02:30",
+                                url="https://youtube.com/watch?v=x&t=120s", chunk_id=1, text="Second chunk text"),
+        }
+
+    def test_grouped_citation_replaced(self):
+        lookup = self._make_lookup()
+        rendered = app.render_clickable_answer("The answer is here [S1, S2].", lookup)
+        assert "00:01:00 - 00:01:30" in rendered
+        assert "00:02:00 - 00:02:30" in rendered
+        assert "[S1, S2]" not in rendered
+
+    def test_single_bracketed_citation_replaced(self):
+        lookup = self._make_lookup()
+        rendered = app.render_clickable_answer("It was stated [S1].", lookup)
+        assert "00:01:00 - 00:01:30" in rendered
+        assert "[S1]" not in rendered
+
+    def test_unknown_source_id_kept_as_is(self):
+        lookup = self._make_lookup()
+        rendered = app.render_clickable_answer("See [S99].", lookup)
+        assert "[S99]" in rendered
+
+    def test_references_section_added_for_used_sources(self):
+        lookup = self._make_lookup()
+        rendered = app.render_clickable_answer("Answer with [S1].", lookup)
+        assert "**References**" in rendered
+        assert "00:01:00 - 00:01:30" in rendered
+
+    def test_no_references_section_when_no_known_sources(self):
+        lookup = self._make_lookup()
+        rendered = app.render_clickable_answer("No citations here.", lookup)
+        assert "**References**" not in rendered
+
+    def test_each_source_appears_once_in_references(self):
+        # LLM cited S1 three times; References should list it only once
+        lookup = self._make_lookup()
+        rendered = app.render_clickable_answer("[S1] and [S1] and [S1].", lookup)
+        references_section = rendered.split("**References**")[-1] if "**References**" in rendered else ""
+        assert references_section.count("00:01:00 - 00:01:30") == 1
+
+

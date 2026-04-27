@@ -90,7 +90,13 @@ class AppConfig:
     whisper_beam_size: int = 1          # usually 1-5 
     whisper_vad_filter: bool = False    # quality: True, speed: False
     whisper_condition_on_previous_text: bool = False    # quality: True, speed: False
-    whisper_word_timestamps: bool = True
+    # word_timestamps=True triggers a DTW (Dynamic Time Warping) alignment pass
+    # after every decoded segment to pin each word to its exact audio position.
+    # On CPU this increases transcription time. 
+    # Word-level data is stored in WordTiming but is not consumed by any current 
+    # pipeline step — segment-level timestamps are sufficient for YouTube deep-link generation. 
+    # Enable only if a word-highlight UI is added.
+    whisper_word_timestamps: bool = False
 
     summary_prompt_version: str = "summary-v1"
     retrieval_prompt_version: str = "qa-with-timestamps-v1"

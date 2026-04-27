@@ -428,3 +428,51 @@ class TestSessionStateSetTranscript:
         assert state.chunks is None
         assert state.faiss_index is None
 
+
+
+class TestSessionStateGradioRoundtrip:
+    def test_roundtrip_preserves_scalar_fields(self):
+        segs = _make_segments_list(2)
+        state = app.SessionState(
+            video_url="https://youtu.be/dQw4w9WgXcQ",
+            video_id="dQw4w9WgXcQ",
+            processed_transcript="text",
+            transcript_hash="abc123",
+            transcript_segments=segs,
+            summary="summary text",
+            last_question="q",
+            last_answer="a",
+        )
+        payload = state.to_gradio()
+        restored = app.SessionState.from_gradio(payload)
+
+        assert restored.video_url == state.video_url
+        assert restored.video_id == state.video_id
+        assert restored.processed_transcript == state.processed_transcript
+        assert restored.transcript_hash == state.transcript_hash
+        assert restored.summary == state.summary
+        assert restored.last_question == state.last_question
+        assert restored.last_answer == state.last_answer
+
+    def test_roundtrip_preserves_segments(self):
+        segs = _make_segments_list(3)
+        state = app.SessionState(transcript_segments=segs)
+        payload = state.to_gradio()
+        restored = app.SessionState.from_gradio(payload)
+        assert len(restored.transcript_segments) == 3
+        assert restored.transcript_segments[0].text == "segment 0"
+
+    def test_roundtrip_preserves_chunks(self):
+        segs = _make_segments_list(3)
+        chunks = app.build_retrieval_chunks(segs)
+        state = app.SessionState(chunks=chunks)
+        payload = state.to_gradio()
+        restored = app.SessionState.from_gradio(payload)
+        assert restored.chunks is not None
+        assert len(restored.chunks) == len(chunks)
+
+    def test_empty_payload_returns_default_state(self):
+        state = app.SessionState.from_gradio(None)
+        assert state.video_url == ""
+        assert state.processed_transcript == ""
+        assert state.chunks is None

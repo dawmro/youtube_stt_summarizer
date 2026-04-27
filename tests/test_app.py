@@ -133,3 +133,73 @@ class TestHashing:
     def test_stable_hash_obj_length_is_16(self):
         assert len(app.stable_hash_obj({"x": "y"})) == 16
 
+
+# ===========================================================================
+# 4. Data-model roundtrips
+# ===========================================================================
+
+def _make_segment_dict(sid=0, start=1.0, end=5.0, text="Hello world") -> Dict[str, Any]:
+    return {
+        "segment_id": sid,
+        "start": start,
+        "end": end,
+        "text": text,
+        "words": [
+            {"word": "Hello", "start": 1.0, "end": 1.5, "probability": 0.99},
+            {"word": "world", "start": 1.6, "end": 2.0, "probability": 0.95},
+        ],
+    }
+
+
+class TestTranscriptSegmentRoundtrip:
+    def test_roundtrip_preserves_all_fields(self):
+        data = _make_segment_dict()
+        seg = app.TranscriptSegment.from_dict(data)
+        restored = seg.to_dict()
+        assert restored["segment_id"] == 0
+        assert restored["start"] == 1.0
+        assert restored["end"] == 5.0
+        assert restored["text"] == "Hello world"
+        assert len(restored["words"]) == 2
+        assert restored["words"][0]["word"] == "Hello"
+
+    def test_missing_words_defaults_to_empty_list(self):
+        data = _make_segment_dict()
+        del data["words"]
+        seg = app.TranscriptSegment.from_dict(data)
+        assert seg.words == []
+
+    def test_types_are_coerced(self):
+        data = _make_segment_dict(sid="3", start="2.5", end="7.0")
+        seg = app.TranscriptSegment.from_dict(data)
+        assert seg.segment_id == 3
+        assert isinstance(seg.start, float)
+        assert isinstance(seg.end, float)
+
+
+class TestRetrievalChunkRoundtrip:
+    def test_roundtrip_preserves_all_fields(self):
+        data = {
+            "chunk_id": 0,
+            "text": "Some transcript text",
+            "start": 0.0,
+            "end": 10.0,
+            "segment_ids": [0, 1, 2],
+        }
+        chunk = app.RetrievalChunk.from_dict(data)
+        restored = chunk.to_dict()
+        assert restored["chunk_id"] == 0
+        assert restored["text"] == "Some transcript text"
+        assert restored["segment_ids"] == [0, 1, 2]
+
+    def test_segment_ids_coerced_to_int(self):
+        data = {
+            "chunk_id": 1,
+            "text": "x",
+            "start": 0.0,
+            "end": 1.0,
+            "segment_ids": ["0", "1"],
+        }
+        chunk = app.RetrievalChunk.from_dict(data)
+        assert chunk.segment_ids == [0, 1]
+

@@ -363,3 +363,68 @@ class TestRenderClickableAnswer:
         assert references_section.count("00:01:00 - 00:01:30") == 1
 
 
+# ===========================================================================
+# 7. SessionState transitions
+# ===========================================================================
+
+def _make_segments_list(n: int = 3) -> List[app.TranscriptSegment]:
+    return _make_segments([f"segment {i}" for i in range(n)])
+
+
+class TestSessionStateNeedsRefresh:
+    def test_no_transcript_always_needs_refresh(self):
+        state = app.SessionState()
+        assert state.needs_transcript_refresh("https://youtu.be/dQw4w9WgXcQ") is True
+
+    def test_empty_url_with_transcript_does_not_need_refresh(self):
+        # Empty URL = "use whatever is in session"
+        state = app.SessionState(
+            video_id="abc",
+            processed_transcript="some text",
+            transcript_hash="hash",
+        )
+        assert state.needs_transcript_refresh("") is False
+
+    def test_same_video_id_does_not_need_refresh(self):
+        state = app.SessionState(
+            video_id="dQw4w9WgXcQ",
+            processed_transcript="transcript text",
+            transcript_hash="h",
+        )
+        assert state.needs_transcript_refresh("https://youtu.be/dQw4w9WgXcQ") is False
+
+    def test_different_video_id_needs_refresh(self):
+        state = app.SessionState(
+            video_id="dQw4w9WgXcQ",
+            processed_transcript="some transcript",
+            transcript_hash="h",
+        )
+        assert state.needs_transcript_refresh("https://youtu.be/AAAAAAAAAAA") is True
+
+
+class TestSessionStateSetTranscript:
+    def test_set_transcript_updates_all_fields(self):
+        state = app.SessionState()
+        segs = _make_segments_list()
+        state.set_transcript("https://youtu.be/dQw4w9WgXcQ", "hello world", segs)
+        assert state.video_id == "dQw4w9WgXcQ"
+        assert state.processed_transcript == "hello world"
+        assert state.transcript_hash == app.text_hash("hello world")
+        assert len(state.transcript_segments) == 3
+
+    def test_set_transcript_resets_derived_state(self):
+        state = app.SessionState(
+            summary="old summary",
+            last_question="q",
+            last_answer="a",
+            chunks=[MagicMock()],
+            faiss_index=MagicMock(),
+        )
+        segs = _make_segments_list()
+        state.set_transcript("https://youtu.be/dQw4w9WgXcQ", "new text", segs)
+        assert state.summary == ""
+        assert state.last_question == ""
+        assert state.last_answer == ""
+        assert state.chunks is None
+        assert state.faiss_index is None
+

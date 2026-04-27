@@ -105,3 +105,31 @@ class TestBuildYoutubeTimeUrl:
         url = app.build_youtube_time_url("abc123", -10)
         assert url == "https://www.youtube.com/watch?v=abc123&t=0s"
 
+
+# ===========================================================================
+# 3. Hash functions
+# ===========================================================================
+
+class TestHashing:
+    def test_text_hash_is_deterministic(self):
+        assert app.text_hash("hello world") == app.text_hash("hello world")
+
+    def test_text_hash_differs_for_different_input(self):
+        assert app.text_hash("hello") != app.text_hash("world")
+
+    def test_text_hash_length_is_16(self):
+        assert len(app.text_hash("anything")) == 16
+
+    def test_stable_hash_obj_is_deterministic(self):
+        obj = {"b": 2, "a": 1}
+        assert app.stable_hash_obj(obj) == app.stable_hash_obj(obj)
+
+    def test_stable_hash_obj_is_key_order_independent(self):
+        assert app.stable_hash_obj({"a": 1, "b": 2}) == app.stable_hash_obj({"b": 2, "a": 1})
+
+    def test_stable_hash_obj_differs_for_different_values(self):
+        assert app.stable_hash_obj({"a": 1}) != app.stable_hash_obj({"a": 2})
+
+    def test_stable_hash_obj_length_is_16(self):
+        assert len(app.stable_hash_obj({"x": "y"})) == 16
+

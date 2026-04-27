@@ -3,19 +3,21 @@
 
 Business goal:
 - Download audio from a YouTube video.
-- Transcribe it locally with faster-whisper.
+- Transcribe it locally with faster-whisper. 
 - Cache transcript and retrieval artifacts so repeated runs stay fast.
 - Summarize the transcript with Ollama.
 - Answer questions from the transcript with FAISS retrieval.
 - Render clickable YouTube timestamp links in Q&A answers.
 """
 
-
+import os
+# Must be set before any C extension (CTranslate2, OpenMP) is loaded.
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["OMP_NUM_THREADS"] = str(os.cpu_count() // 2) # optional
 
 import hashlib
 import json
 import logging
-import os
 import re
 import requests
 import subprocess
@@ -47,9 +49,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
-
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-os.environ["OMP_NUM_THREADS"] = "4"
 
 
 # =============================================================================
@@ -83,7 +82,7 @@ class AppConfig:
     embed_chunk_overlap_segments: int = 1
     retrieval_top_k: int = 4
 
-    whisper_model_size: str = "small"   # "small", "Medium", "large-v3"
+    whisper_model_size: str = "small"   # "small", "medium", "large-v3"
     whisper_device: str = "cpu"         # "cpu" or "cuda"
     whisper_compute_type: str = "int8"  # "int8" or "float16"
     whisper_language: Optional[str] = None
@@ -635,42 +634,42 @@ def transcribe_audio(
     if CFG.whisper_language:
         kwargs["language"] = CFG.whisper_language
 
-    with log_time("whisper transcription"):
+    with log_time("create whisper generator"):
         segments, info = runtime.whisper.transcribe(str(audio_path), **kwargs)
+    with log_time("run whisper inference for chunk"):
+        transcript_lines: List[str] = []
+        structured_segments: List[TranscriptSegment] = []
 
-    transcript_lines: List[str] = []
-    structured_segments: List[TranscriptSegment] = []
-
-    for seg_idx, seg in enumerate(segments):
-        text = seg.text.strip()
-        if not text:
-            continue
-        transcript_lines.append(text)
-        words: List[WordTiming] = []
-        for word in getattr(seg, "words", None) or []:
-            if getattr(word, "word", None) is None:
+        for seg_idx, seg in enumerate(segments):
+            text = seg.text.strip()
+            if not text:
                 continue
-            words.append(
-                WordTiming(
-                    word=str(word.word),
-                    start=float(word.start) if word.start is not None else None,
-                    end=float(word.end) if word.end is not None else None,
-                    probability=(
-                        float(word.probability)
-                        if getattr(word, "probability", None) is not None
-                        else None
-                    ),
+            transcript_lines.append(text)
+            words: List[WordTiming] = []
+            for word in getattr(seg, "words", None) or []:
+                if getattr(word, "word", None) is None:
+                    continue
+                words.append(
+                    WordTiming(
+                        word=str(word.word),
+                        start=float(word.start) if word.start is not None else None,
+                        end=float(word.end) if word.end is not None else None,
+                        probability=(
+                            float(word.probability)
+                            if getattr(word, "probability", None) is not None
+                            else None
+                        ),
+                    )
+                )
+            structured_segments.append(
+                TranscriptSegment(
+                    segment_id=seg_idx,
+                    start=float(seg.start) if seg.start is not None else 0.0,
+                    end=float(seg.end) if seg.end is not None else 0.0,
+                    text=text,
+                    words=words,
                 )
             )
-        structured_segments.append(
-            TranscriptSegment(
-                segment_id=seg_idx,
-                start=float(seg.start) if seg.start is not None else 0.0,
-                end=float(seg.end) if seg.end is not None else 0.0,
-                text=text,
-                words=words,
-            )
-        )
 
     transcript = "\n".join(transcript_lines).strip()
     if not transcript:

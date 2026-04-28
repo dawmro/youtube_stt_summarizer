@@ -562,7 +562,7 @@ Context:
 Question: {question}
 
 Answer:""",
-        ["context", "question"],
+        ["context", "question", "chat_history"],
     )
 
     logger.info("Models initialized successfully")
@@ -1134,8 +1134,7 @@ class SessionState:
 
     Derived fields (cleared by reset_derived when a new transcript is loaded):
         summary       — the most recently generated summary text.
-        last_question — the last question the user asked.
-        last_answer   — the rendered Markdown answer to last_question.
+        chat_history  — List[Dict[str, str]] conversation history
         chunks        — List[RetrievalChunk] built from transcript_segments.
         faiss_index   — FAISS vector store built from chunks.
     """
@@ -1148,8 +1147,8 @@ class SessionState:
 
     # --- derived fields (cleared when transcript changes) ---
     summary: str = ""
-    last_question: str = ""
-    last_answer: str = ""
+    # Gradio's chatbot component natively serializes history as lists of lists
+    chat_history: List[Dict[str, str]] = field(default_factory=list)
     chunks: Optional[List[RetrievalChunk]] = None
     faiss_index: Optional[Any] = None
 
@@ -1165,8 +1164,7 @@ class SessionState:
         never accidentally served for a different video.
         """
         self.summary = ""
-        self.last_question = ""
-        self.last_answer = ""
+        self.chat_history = []
         self.chunks = None
         self.faiss_index = None
 
@@ -1237,8 +1235,7 @@ class SessionState:
             "transcript_hash": self.transcript_hash,
             "transcript_segments": [s.to_dict() for s in self.transcript_segments],
             "summary": self.summary,
-            "last_question": self.last_question,
-            "last_answer": self.last_answer,
+            "chat_history": self.chat_history,
             "chunks": (
                 [c.to_dict() for c in self.chunks]
                 if self.chunks is not None
@@ -1280,8 +1277,7 @@ class SessionState:
                 if isinstance(s, dict)
             ],
             summary=str(payload.get("summary", "")),
-            last_question=str(payload.get("last_question", "")),
-            last_answer=str(payload.get("last_answer", "")),
+            chat_history=payload.get("chat_history", []),
             chunks=(
                 [
                     RetrievalChunk.from_dict(c)
@@ -1748,21 +1744,21 @@ def _make_qa_handler(runtime: RuntimeDeps):
 
         # ── Input validation ─────────────────────────────────────────────────
         if not question:
-            yield "❌ Please provide a question.", "", 0, state.to_gradio()
+            yield "❌ Please provide a question.", state.chat_history, 0, state.to_gradio()
             return
         if video_url.strip() and not get_video_id(video_url):
-            yield "❌ Invalid YouTube URL.", "", 0, state.to_gradio()
+            yield "❌ Invalid YouTube URL.", state.chat_history, 0, state.to_gradio()
             return
         if not video_url.strip() and not state.processed_transcript:
             yield (
                 "❌ No transcript in session. Provide a YouTube URL first.",
-                "", 0, state.to_gradio(),
+                state.chat_history, 0, state.to_gradio(),
             )
             return
 
         try:
             progress = 0
-            yield "🚀 Starting Q&A pipeline...", "", progress, state.to_gradio()
+            yield "🚀 Starting Q&A pipeline...", state.chat_history, progress, state.to_gradio()
 
             # ── Transcript fetch (skipped when session already has it) ────────
             if state.needs_transcript_refresh(video_url):
@@ -1774,10 +1770,13 @@ def _make_qa_handler(runtime: RuntimeDeps):
                     progress = min(40, max(5, int(update.progress * 0.4)))
                     transcript = update.transcript or transcript
                     segments = update.segments or segments
-                    yield update.message, "", progress, state.to_gradio()
+                    yield update.message, state.chat_history, progress, state.to_gradio()
 
                 if not transcript or not segments:
                     raise RuntimeError("Failed to fetch transcript.")
+                
+                # Note: set_transcript() calls reset_derived(), which clears chat_history.
+                # This is intentional: switching videos starts a fresh conversation.
                 state.set_transcript(video_url, transcript, segments)
 
             elif not state.transcript_segments:
@@ -1798,7 +1797,7 @@ def _make_qa_handler(runtime: RuntimeDeps):
             progress = 65
             yield (
                 "🗂️ Loading or building FAISS index...",
-                "", progress, state.to_gradio(),
+                state.chat_history, progress, state.to_gradio(),
             )
             faiss_index = get_or_create_faiss(state, runtime)
 
@@ -1806,49 +1805,55 @@ def _make_qa_handler(runtime: RuntimeDeps):
             progress = 80
             yield (
                 "🔎 Searching transcript for relevant context...",
-                "", progress, state.to_gradio(),
+                state.chat_history, progress, state.to_gradio(),
             )
             with log_time("FAISS similarity search"):
                 docs = faiss_index.similarity_search(question, k=CFG.retrieval_top_k)
 
             if not docs:
-                state.last_question = question
-                state.last_answer = (
-                    "I couldn't find relevant transcript evidence "
-                    "for that question."
-                )
-                yield "✅ Answer ready.", state.last_answer, 100, state.to_gradio()
+                state.chat_history.append({"role": "user", "content": question})
+                state.chat_history.append({"role": "assistant", "content": "I couldn't find relevant transcript evidence for that question."})
+                yield "✅ Answer ready.", state.chat_history, 100, state.to_gradio()
                 return
 
             context, source_lookup = build_context_with_sources(docs, state.video_id)
             if not context.strip():
-                state.last_question = question
-                state.last_answer = (
-                    "I couldn't build usable context from the "
-                    "retrieved transcript chunks."
-                )
-                yield "✅ Answer ready.", state.last_answer, 100, state.to_gradio()
+                state.chat_history.append({"role": "user", "content": question})
+                state.chat_history.append({"role": "assistant", "content": "I couldn't build usable context from the retrieved chunks."})
+                yield "✅ Answer ready.", state.chat_history, 100, state.to_gradio()
                 return
+            
+            # ── Format history for prompt (messages format) ──────────────
+            history_str = "\n".join(
+                f"{msg['role'].capitalize()}: {msg['content']}" 
+                for msg in state.chat_history[-10:]  # last 5 turns
+            ) if state.chat_history else "None"
 
             # ── LLM answer generation ────────────────────────────────────────
             progress = 90
             yield (
-                f"🧠 Context ready "
-                f"({estimate_tokens(context)} tokens). Generating answer...",
-                "", progress, state.to_gradio(),
+                f"🧠 Context ready ({estimate_tokens(context)} tokens). Generating answer...",
+                state.chat_history, 
+                progress, 
+                state.to_gradio()
             )
+
             with log_time("QA generation"):
                 raw_answer = runtime.qa_chain.predict(
-                    context=context, question=question
+                    context=context, question=question, chat_history=history_str
                 ).strip()
 
-            state.last_question = question
-            state.last_answer = render_clickable_answer(raw_answer, source_lookup)
-            yield "✅ Answer ready.", state.last_answer, 100, state.to_gradio()
+            rendered_answer = render_clickable_answer(raw_answer, source_lookup)
+
+            # ── Append to history in Gradio messages format ──────────────
+            state.chat_history.append({"role": "user", "content": question})
+            state.chat_history.append({"role": "assistant", "content": rendered_answer})
+
+            yield "✅ Answer ready.", state.chat_history, 100, state.to_gradio()
 
         except Exception as exc:
             logger.exception("Q&A pipeline error")
-            yield f"❌ Error: {exc}", "", 0, state.to_gradio()
+            yield f"❌ Error: {exc}", state.chat_history, 0, state.to_gradio()
 
     return answer_question_gradio
 
@@ -1875,7 +1880,7 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
             Row:   Ask button
             Label: status
             Slider: progress
-            Markdown: answer (supports clickable timestamp links)
+            Markdown: chatbot (supports clickable timestamp links)
 
     A hidden gr.State component carries the SessionState payload between
     handler calls.  Both handlers receive it as their last input and emit
@@ -1982,12 +1987,12 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
                     minimum=0, maximum=100, value=0,
                     interactive=False,
                 )
-                answer_out = gr.Markdown(label="Answer")
+                chatbot = gr.Chatbot(label="Conversation", height=400)
 
                 ask_btn.click(
                     fn=qa_handler,
                     inputs=[video_url_qa, question_input, session_state],
-                    outputs=[status_qa, answer_out, qa_progress, session_state],
+                    outputs=[status_qa, chatbot, qa_progress, session_state],
                 )
 
     return interface

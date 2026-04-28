@@ -101,7 +101,6 @@ class AppConfig:
     retrieval_prompt_version: str = "qa-with-timestamps-v1"
     transcript_schema_version: str = "timestamped-transcript-v1"
     retrieval_schema_version: str = "timestamped-retrieval-v1"
-    trust_faiss_cache: bool = True
 
     @property
     def max_transcript_tokens(self) -> int:

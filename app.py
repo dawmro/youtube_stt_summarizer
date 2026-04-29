@@ -837,6 +837,7 @@ def chunk_transcript_for_summary(text: str) -> List[str]:
 def summarize_transcript_stream(
     text: str,
     runtime: RuntimeDeps,
+    prompt_override: str = "",
 ) -> Generator[SummaryUpdate, None, None]:
     """Summarize transcript directly or through iterative hierarchical reduction.
 
@@ -852,7 +853,8 @@ def summarize_transcript_stream(
     if estimate_tokens(text) <= CFG.max_transcript_tokens:
         yield SummaryUpdate("📝 Generating direct summary...", None, 30)
         with log_time("direct summary generation"):
-            summary = runtime.summary_chain.predict(transcript=text).strip()
+            tpl = prompt_override or runtime.summary_chain.prompt.template
+            summary = run_llm_dynamic(runtime.llm, tpl, {"transcript": text})
         if not summary:
             raise RuntimeError("Direct summary generation returned empty output.")
         yield SummaryUpdate("✅ Final summary ready.", summary, 100)
@@ -876,9 +878,8 @@ def summarize_transcript_stream(
                 f"📝 Summarizing chunk {idx}/{total}...", None, progress
             )
             with log_time(f"chunk summary {pass_idx}:{idx}/{total}"):
-                chunk_summary = runtime.chunk_summary_chain.predict(
-                    chunk=chunk
-                ).strip()
+                tpl = prompt_override or runtime.chunk_summary_chain.prompt.template
+                chunk_summary = run_llm_dynamic(runtime.llm, tpl, {"chunk": chunk})
             if not chunk_summary:
                 raise RuntimeError(
                     f"Chunk summary {idx} returned empty output."
@@ -898,9 +899,8 @@ def summarize_transcript_stream(
                 90,
             )
             with log_time("final merged summary generation"):
-                final_summary = runtime.reduce_summary_chain.predict(
-                    summaries=merged
-                ).strip()
+                tpl = prompt_override or runtime.reduce_summary_chain.prompt.template
+                final_summary = run_llm_dynamic(runtime.llm, tpl, {"summaries": merged})
             if not final_summary:
                 raise RuntimeError(
                     "Final summary generation returned empty output."
@@ -1137,6 +1137,8 @@ class SessionState:
         chat_history  — List[Dict[str, str]] conversation history
         chunks        — List[RetrievalChunk] built from transcript_segments.
         faiss_index   — FAISS vector store built from chunks.
+        summary_prompt_override - Summary prompt override.
+        qa_prompt_override - Question and answer prompt override.
     """
     # --- transcript fields ---
     video_url: str = ""
@@ -1151,6 +1153,8 @@ class SessionState:
     chat_history: List[Dict[str, str]] = field(default_factory=list)
     chunks: Optional[List[RetrievalChunk]] = None
     faiss_index: Optional[Any] = None
+    summary_prompt_override: str = ""
+    qa_prompt_override: str = ""
 
     # ------------------------------------------------------------------ #
     # Mutation helpers                                                     #
@@ -1243,6 +1247,8 @@ class SessionState:
             ),
             # Kept by reference — not serialised to JSON.
             "faiss_index": self.faiss_index,
+            "summary_prompt_override": self.summary_prompt_override,
+            "qa_prompt_override": self.qa_prompt_override,
         }
 
     @classmethod
@@ -1289,6 +1295,8 @@ class SessionState:
             ),
             # Live object or None — passed through from to_gradio().
             faiss_index=payload.get("faiss_index"),
+            summary_prompt_override=str(payload.get("summary_prompt_override", "")),
+            qa_prompt_override=str(payload.get("qa_prompt_override", "")),
         )
 
 # =============================================================================
@@ -1574,6 +1582,17 @@ def render_clickable_answer(
 # GRADIO HANDLERS
 # =============================================================================
 
+def run_llm_dynamic(llm: Ollama, template: str, inputs: Dict[str, str]) -> str:
+    """Run LLM with a custom prompt template without rebuilding chains.
+    
+    Falls back gracefully if the template is empty. LangChain will raise
+    a clear KeyError if the template references missing input variables.
+    """
+    prompt = PromptTemplate(template=template, input_variables=list(inputs.keys()))
+    chain = LLMChain(llm=llm, prompt=prompt)
+    return chain.predict(**inputs).strip()
+
+
 def _make_summarize_handler(runtime: RuntimeDeps):
     """Factory returning summarize_video_gradio closed over runtime.
 
@@ -1584,6 +1603,7 @@ def _make_summarize_handler(runtime: RuntimeDeps):
     def summarize_video_gradio(
         video_url: str,
         state_payload: Dict[str, Any],
+        summary_prompt_override: str,
     ) -> Generator:
         """Run transcript + summary pipeline and stream UI updates.
 
@@ -1593,6 +1613,7 @@ def _make_summarize_handler(runtime: RuntimeDeps):
              stt_progress, summary_progress, state)
         """
         state = SessionState.from_gradio(state_payload)
+        state.summary_prompt_override = summary_prompt_override.strip()
         started_at = time.perf_counter()
 
         if not video_url.strip():
@@ -1677,7 +1698,7 @@ def _make_summarize_handler(runtime: RuntimeDeps):
 
             # ── Summary generation ───────────────────────────────────────────
             for update in summarize_transcript_stream(
-                state.processed_transcript, runtime
+                state.processed_transcript, runtime, state.summary_prompt_override
             ):
                 summary_progress = update.progress
                 if update.summary:
@@ -1729,6 +1750,7 @@ def _make_qa_handler(runtime: RuntimeDeps):
         video_url: str,
         user_question: str,
         state_payload: Dict[str, Any],
+        qa_prompt_override: str,
     ) -> Generator:
         """Run timestamp-aware transcript Q&A and stream UI updates.
 
@@ -1740,6 +1762,7 @@ def _make_qa_handler(runtime: RuntimeDeps):
         Skips transcript fetch if the session already has it cached.
         """
         state = SessionState.from_gradio(state_payload)
+        state.qa_prompt_override = qa_prompt_override.strip()
         question = user_question.strip()
 
         # ── Input validation ─────────────────────────────────────────────────
@@ -1839,9 +1862,10 @@ def _make_qa_handler(runtime: RuntimeDeps):
             )
 
             with log_time("QA generation"):
-                raw_answer = runtime.qa_chain.predict(
-                    context=context, question=question, chat_history=history_str
-                ).strip()
+                tpl = state.qa_prompt_override or runtime.qa_chain.prompt.template
+                raw_answer = run_llm_dynamic(runtime.llm, tpl, {
+                    "context": context, "question": question, "chat_history": history_str
+                })
 
             rendered_answer = render_clickable_answer(raw_answer, source_lookup)
 
@@ -1870,13 +1894,14 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
             Row:   YouTube URL input  |  Summarize button
             Label: status
             Row:   STT progress slider  |  Summary progress slider
-            Text:  token info
-            Text:  transcript stats
+            Text:  token info           |  transcript stats
+            Accordion > Text:  Summary prompt override textarea
             Row:   Transcript textarea  |  Summary textarea
 
         Tab 2 — Q&A
             Row:   YouTube URL input (blank = reuse session)
             Text:  question input
+            Accordion > Text:  Q&A prompt override textarea
             Row:   Ask button
             Label: status
             Slider: progress
@@ -1926,11 +1951,18 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
                         minimum=0, maximum=100, value=0,
                         interactive=False,
                     )
+                with gr.Row():
+                    token_info = gr.Textbox(label="Token Info", interactive=False)
+                    stats_info = gr.Textbox(
+                        label="Transcript Stats", interactive=False
+                    )
 
-                token_info = gr.Textbox(label="Token Info", interactive=False)
-                stats_info = gr.Textbox(
-                    label="Transcript Stats", interactive=False
-                )
+                with gr.Accordion("🛠️ Summary Prompt Override", open=False):
+                    summary_prompt_input = gr.Textbox(
+                        label="Custom Summary Prompt (leave blank to use default)",
+                        lines=6,
+                        placeholder="You are an AI assistant that summarizes...\nUse {transcript}, {chunk}, or {summaries} as variables.",
+                    )
 
                 with gr.Row():
                     transcript_out = gr.Textbox(
@@ -1946,7 +1978,7 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
 
                 summarize_btn.click(
                     fn=summarize_handler,
-                    inputs=[video_url_sum, session_state],
+                    inputs=[video_url_sum, session_state, summary_prompt_input],
                     outputs=[
                         status_sum,
                         token_info,
@@ -1978,6 +2010,13 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
                     lines=2,
                 )
 
+                with gr.Accordion("🛠️ QA Prompt Override", open=False):
+                    qa_prompt_input = gr.Textbox(
+                        label="Custom QA Prompt (leave blank to use default)",
+                        lines=6,
+                        placeholder="Answer the question using ONLY the context...\nUse {context}, {question}, {chat_history} as variables.",
+                    )
+
                 with gr.Row():
                     ask_btn = gr.Button("🔎 Ask", variant="primary")
 
@@ -1991,7 +2030,7 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
 
                 ask_btn.click(
                     fn=qa_handler,
-                    inputs=[video_url_qa, question_input, session_state],
+                    inputs=[video_url_qa, question_input, session_state, qa_prompt_input],
                     outputs=[status_qa, chatbot, qa_progress, session_state],
                 )
 

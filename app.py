@@ -21,6 +21,7 @@ import logging
 import re
 import requests
 import subprocess
+import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -1883,6 +1884,71 @@ def _make_qa_handler(runtime: RuntimeDeps):
 
 
 # =============================================================================
+# EXPORT HELPER FUNCTIONS
+# =============================================================================
+
+def _create_temp_file(content: str, filename: str) -> str:
+    """Write content to a temporary file and return its path for Gradio.
+    
+    Gradio automatically copies returned file paths to its internal serving
+    directory, so the original temp file can safely persist until OS cleanup.
+    """
+    tmp_dir = tempfile.mkdtemp(prefix="yt_stt_export_")
+    file_path = Path(tmp_dir) / filename
+    file_path.write_text(content, encoding="utf-8")
+    return str(file_path)
+
+
+def handle_export_transcript(state_payload: Dict[str, Any]) -> Optional[str]:
+    state = SessionState.from_gradio(state_payload)
+    if not state.processed_transcript:
+        logger.info("Export skipped: no transcript in session.")
+        return None
+    path = _create_temp_file(
+        state.processed_transcript,
+        f"{state.video_id or 'transcript'}_transcript.txt"
+    )
+    logger.info("Exporting transcript → %s", path)
+    return path
+
+def handle_export_summary(state_payload: Dict[str, Any]) -> Optional[str]:
+    state = SessionState.from_gradio(state_payload)
+    if not state.summary:
+        logger.info("Export skipped: no summary in session.")
+        return None
+    md_content = f"# Video Summary\n\n{state.summary}"
+    path = _create_temp_file(md_content, f"{state.video_id or 'summary'}_summary.md")
+    logger.info("Exporting summary → %s", path)
+    return path
+
+def handle_export_chat(state_payload: Dict[str, Any]) -> Optional[str]:
+    state = SessionState.from_gradio(state_payload)
+    if not state.chat_history:
+        logger.info("Export skipped: no chat history in session.")
+        return None
+    
+    lines = ["# Chat History\n"]
+    for msg in state.chat_history:
+        role = msg.get("role", "unknown").capitalize()
+        content = msg.get("content", "")
+        lines.append(f"**{role}:**\n{content}\n")
+    
+    md_content = "\n---\n".join(lines)
+    path = _create_temp_file(md_content, f"{state.video_id or 'chat'}_history.md")
+    logger.info("Exporting chat → %s", path)
+    return path
+
+def handle_export_session_json(state_payload: Dict[str, Any]) -> Optional[str]:
+    safe_payload = dict(state_payload)
+    safe_payload.pop("faiss_index", None)
+    path = _create_temp_file(
+        json.dumps(safe_payload, indent=2, ensure_ascii=False),
+        "session_export.json"
+    )
+    logger.info("Exporting session JSON → %s", path)
+    return path
+
+# =============================================================================
 # GRADIO INTERFACE
 # =============================================================================
 
@@ -1915,6 +1981,12 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
     qa_handler = _make_qa_handler(runtime)
 
     with gr.Blocks(title="YouTube STT Summarizer & Q&A") as interface:
+        gr.HTML("""
+        <style>
+            .export-file:has(.file-preview) { display: block !important; }
+            .export-file:not(:has(.file-preview)) { display: none !important; }
+        </style>
+        """)
         session_state = gr.State(value={})
 
         gr.Markdown("# 🎥 YouTube STT Summarizer & Timestamp-Aware Q&A")
@@ -1976,6 +2048,15 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
                         interactive=False,
                     )
 
+                with gr.Row():
+                    export_transcript_btn = gr.Button("📥 Export Transcript (.txt)")
+                    export_summary_btn = gr.Button("📥 Export Summary (.md)")
+                    export_json_btn = gr.Button("📦 Export Session (.json)")
+
+                transcript_file = gr.File(label="Transcript Download", interactive=False, elem_classes=["export-file"])
+                summary_file = gr.File(label="Summary Download", interactive=False, elem_classes=["export-file"])
+                session_file = gr.File(label="Session JSON", interactive=False, elem_classes=["export-file"])
+
                 summarize_btn.click(
                     fn=summarize_handler,
                     inputs=[video_url_sum, session_state, summary_prompt_input],
@@ -2028,11 +2109,36 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
                 )
                 chatbot = gr.Chatbot(label="Conversation", height=400)
 
+                export_chat_btn = gr.Button("📥 Export Chat History (.md)")
+                chat_file = gr.File(label="Chat Download", interactive=False, elem_classes=["export-file"])
+
                 ask_btn.click(
                     fn=qa_handler,
                     inputs=[video_url_qa, question_input, session_state, qa_prompt_input],
                     outputs=[status_qa, chatbot, qa_progress, session_state],
                 )
+
+            # ── Export Button Wiring ─────────────────────────────────────────────
+            export_transcript_btn.click(
+                fn=handle_export_transcript,
+                inputs=[session_state],
+                outputs=[transcript_file],
+            )
+            export_summary_btn.click(
+                fn=handle_export_summary,
+                inputs=[session_state],
+                outputs=[summary_file],
+            )
+            export_json_btn.click(
+                fn=handle_export_session_json,
+                inputs=[session_state],
+                outputs=[session_file],
+            )
+            export_chat_btn.click(
+                fn=handle_export_chat,
+                inputs=[session_state],
+                outputs=[chat_file],
+            )
 
     return interface
 

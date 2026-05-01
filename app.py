@@ -1732,28 +1732,29 @@ def _make_summarize_handler(runtime: RuntimeDeps):
                 state.to_gradio(),
             )
 
-        except KeyboardInterrupt:
-            logger.info("Summarize pipeline cancelled by user.")
-            yield (
-                "⛔ Cancelled by user.",
-                token_info if 'token_info' in locals() else "",
-                state.processed_transcript,
-                state.summary,
-                stats_info if 'stats_info' in locals() else "",
-                stt_progress if 'stt_progress' in locals() else 0,
-                summary_progress if 'summary_progress' in locals() else 0,
-                state.to_gradio(),
-            )
-        except Exception as exc:
-            logger.exception("Summarize pipeline error")
-            yield (
-                f"❌ Error: {exc}",
-                token_info if 'token_info' in locals() else "",
-                "", "", "",
-                stt_progress if 'stt_progress' in locals() else 0,
-                summary_progress if 'summary_progress' in locals() else 0,
-                state.to_gradio(),
-            )
+        except BaseException as exc:
+            # Gradio cancellation raises CancelledError/KeyboardInterrupt/GeneratorExit
+            is_cancel = isinstance(exc, (KeyboardInterrupt, GeneratorExit)) or "cancel" in type(exc).__name__.lower()
+            
+            if is_cancel:
+                logger.info("Summarize pipeline cancelled by user.")
+                yield (
+                    "⛔ Cancelled by user.",
+                    token_info if 'token_info' in locals() else "",
+                    state.processed_transcript,
+                    state.summary,
+                    stats_info if 'stats_info' in locals() else "",
+                    0, 0, state.to_gradio(),
+                )
+            else:
+                logger.exception("Summarize pipeline error")
+                yield (
+                    f"❌ Error: {exc}",
+                    token_info if 'token_info' in locals() else "",
+                    "", "", "",
+                    0, 0, state.to_gradio(),
+                )
+            return  # Critical: ensures generator exits cleanly after final yield
 
     return summarize_video_gradio
 
@@ -1893,13 +1894,17 @@ def _make_qa_handler(runtime: RuntimeDeps):
 
             yield "✅ Answer ready.", state.chat_history, 100, state.to_gradio()
 
-        except KeyboardInterrupt:
-            logger.info("Q&A pipeline cancelled by user.")
-            yield "⛔ Cancelled by user.", state.chat_history if hasattr(state, 'chat_history') else "", progress, state.to_gradio()
-        except Exception as exc:
-            logger.exception("Q&A pipeline error")
-            yield f"❌ Error: {exc}", state.chat_history if hasattr(state, 'chat_history') else "", 0, state.to_gradio()
-
+        except BaseException as exc:
+            is_cancel = isinstance(exc, (KeyboardInterrupt, GeneratorExit)) or "cancel" in type(exc).__name__.lower()
+            
+            if is_cancel:
+                logger.info("Q&A pipeline cancelled by user.")
+                yield "⛔ Cancelled by user.", state.chat_history, 0, state.to_gradio()
+            else:
+                logger.exception("Q&A pipeline error")
+                yield f"❌ Error: {exc}", state.chat_history, 0, state.to_gradio()
+            return  # Critical: clean exit
+        
     return answer_question_gradio
 
 
@@ -2070,9 +2075,8 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
                         placeholder="https://www.youtube.com/watch?v=...",
                         scale=5,
                     )
-                    summarize_btn = gr.Button(
-                        "▶ Summarize", variant="primary", scale=1
-                    )
+                    summarize_btn = gr.Button("▶ Summarize", variant="primary", scale=2)
+                    cancel_sum_btn = gr.Button("⛔ Cancel", variant="stop", scale=1)
 
                 status_sum = gr.Label(label="Status")
 
@@ -2121,7 +2125,7 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
                 summary_file = gr.File(label="Summary Download", interactive=False, elem_classes=["export-file"])
                 session_file = gr.File(label="Session JSON", interactive=False, elem_classes=["export-file"])
 
-                summarize_btn.click(
+                sum_event = summarize_btn.click(
                     fn=summarize_handler,
                     inputs=[video_url_sum, session_state, summary_prompt_input],
                     outputs=[
@@ -2134,7 +2138,10 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
                         summary_progress,
                         session_state,
                     ],
+                    show_progress="full",
                 )
+                # Wire cancel button to interrupt the running generator
+                cancel_sum_btn.click(fn=None, inputs=None, outputs=None, cancels=[sum_event])
            
                 export_transcript_btn.click(
                     fn=handle_export_transcript,
@@ -2179,7 +2186,8 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
                     )
 
                 with gr.Row():
-                    ask_btn = gr.Button("🔎 Ask", variant="primary")
+                    ask_btn = gr.Button("🔎 Ask", variant="primary", scale=2)
+                    cancel_qa_btn = gr.Button("⛔ Cancel", variant="stop", scale=1)
 
                 status_qa = gr.Label(label="Status")
                 qa_progress = gr.Slider(
@@ -2192,11 +2200,13 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
                 export_chat_btn = gr.Button("📥 Export Chat History (.md)")
                 chat_file = gr.File(label="Chat Download", interactive=False, elem_classes=["export-file"])
 
-                ask_btn.click(
+                qa_event = ask_btn.click(
                     fn=qa_handler,
                     inputs=[video_url_qa, question_input, session_state, qa_prompt_input],
                     outputs=[status_qa, chatbot, qa_progress, session_state],
+                    show_progress="full",
                 )
+                cancel_qa_btn.click(fn=None, inputs=None, outputs=None, cancels=[qa_event])
 
                 export_chat_btn.click(
                     fn=handle_export_chat,

@@ -21,6 +21,7 @@ import logging
 import re
 import requests
 import subprocess
+import shutil
 import tempfile
 import time
 from contextlib import contextmanager
@@ -1731,11 +1732,27 @@ def _make_summarize_handler(runtime: RuntimeDeps):
                 state.to_gradio(),
             )
 
+        except KeyboardInterrupt:
+            logger.info("Summarize pipeline cancelled by user.")
+            yield (
+                "⛔ Cancelled by user.",
+                token_info if 'token_info' in locals() else "",
+                state.processed_transcript,
+                state.summary,
+                stats_info if 'stats_info' in locals() else "",
+                stt_progress if 'stt_progress' in locals() else 0,
+                summary_progress if 'summary_progress' in locals() else 0,
+                state.to_gradio(),
+            )
         except Exception as exc:
             logger.exception("Summarize pipeline error")
             yield (
                 f"❌ Error: {exc}",
-                "", "", "", "", 0, 0, state.to_gradio(),
+                token_info if 'token_info' in locals() else "",
+                "", "", "",
+                stt_progress if 'stt_progress' in locals() else 0,
+                summary_progress if 'summary_progress' in locals() else 0,
+                state.to_gradio(),
             )
 
     return summarize_video_gradio
@@ -1876,9 +1893,12 @@ def _make_qa_handler(runtime: RuntimeDeps):
 
             yield "✅ Answer ready.", state.chat_history, 100, state.to_gradio()
 
+        except KeyboardInterrupt:
+            logger.info("Q&A pipeline cancelled by user.")
+            yield "⛔ Cancelled by user.", state.chat_history if hasattr(state, 'chat_history') else "", progress, state.to_gradio()
         except Exception as exc:
             logger.exception("Q&A pipeline error")
-            yield f"❌ Error: {exc}", state.chat_history, 0, state.to_gradio()
+            yield f"❌ Error: {exc}", state.chat_history if hasattr(state, 'chat_history') else "", 0, state.to_gradio()
 
     return answer_question_gradio
 
@@ -1948,6 +1968,40 @@ def handle_export_session_json(state_payload: Dict[str, Any]) -> Optional[str]:
     logger.info("Exporting session JSON → %s", path)
     return path
 
+
+def get_cache_stats() -> str:
+    """Calculate total cache size and return a formatted status string."""
+    if not PATHS.root.exists():
+        return "📦 Cache Size: 0.00 MB | 📁 Location: `(not created yet)`"
+    try:
+        total_bytes = sum(f.stat().st_size for f in PATHS.root.rglob("*") if f.is_file())
+        total_mb = total_bytes / (1024 * 1024)
+        return f"📦 Cache Size: {total_mb:.2f} MB | 📁 Location: `{PATHS.root}`"
+    except Exception as exc:
+        logger.warning("Failed to calculate cache size: %s", exc)
+        return "⚠️ Unable to calculate cache size."
+
+def clear_cache() -> str:
+    """Safely delete all cache files and recreate directory structure.
+    
+    Note: This only removes on-disk artifacts. In-memory SessionState 
+    (transcript, FAISS index, chat history) remains intact until the 
+    user refreshes the page or loads a new video.
+    """
+    try:
+        if PATHS.root.exists():
+            shutil.rmtree(PATHS.root)
+        PATHS.ensure()
+        logger.info("Cache directory cleared and recreated.")
+        return "✅ Cache cleared successfully."
+    except PermissionError as exc:
+        logger.warning("Permission denied while clearing cache: %s", exc)
+        return "⚠️ Partial clear: some files are locked by active processes."
+    except Exception as exc:
+        logger.exception("Failed to clear cache")
+        return f"❌ Failed to clear cache: {exc}"
+
+
 # =============================================================================
 # GRADIO INTERFACE
 # =============================================================================
@@ -1960,27 +2014,37 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
             Row:   YouTube URL input  |  Summarize button
             Label: status
             Row:   STT progress slider  |  Summary progress slider
-            Text:  token info           |  transcript stats
-            Accordion > Text:  Summary prompt override textarea
+            Row:   Token info           |  Transcript stats
+            Accordion > Textbox: Summary prompt override
             Row:   Transcript textarea  |  Summary textarea
+            Row:   Export buttons (Transcript, Summary, Session JSON)
+            File:  Hidden download slots (revealed on export)
 
         Tab 2 — Q&A
             Row:   YouTube URL input (blank = reuse session)
-            Text:  question input
-            Accordion > Text:  Q&A prompt override textarea
+            Textbox: Question input
+            Accordion > Textbox: Q&A prompt override
             Row:   Ask button
             Label: status
             Slider: progress
-            Markdown: chatbot (supports clickable timestamp links)
+            Chatbot: Conversational history with clickable timestamp citations
+            Button: Export chat history
+            File:  Hidden chat download slot
+
+        Tab 3 — Settings & Cache
+            Markdown: Live cache size & path stats
+            Row:   Refresh stats button  |  Clear cache button
+            Label: Operation status feedback
 
     A hidden gr.State component carries the SessionState payload between
-    handler calls.  Both handlers receive it as their last input and emit
+    handler calls. Both handlers receive it as their last input and emit
     an updated payload as their last output.
     """
     summarize_handler = _make_summarize_handler(runtime)
     qa_handler = _make_qa_handler(runtime)
 
     with gr.Blocks(title="YouTube STT Summarizer & Q&A") as interface:
+        # CSS to hide empty export file slots until a download is ready
         gr.HTML("""
         <style>
             .export-file:has(.file-preview) { display: block !important; }
@@ -2071,6 +2135,22 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
                         session_state,
                     ],
                 )
+           
+                export_transcript_btn.click(
+                    fn=handle_export_transcript,
+                    inputs=[session_state],
+                    outputs=[transcript_file],
+                )
+                export_summary_btn.click(
+                    fn=handle_export_summary,
+                    inputs=[session_state],
+                    outputs=[summary_file],
+                )
+                export_json_btn.click(
+                    fn=handle_export_session_json,
+                    inputs=[session_state],
+                    outputs=[session_file],
+                )
 
             # ── Tab 2: Q&A ───────────────────────────────────────────────────
             with gr.TabItem("❓ Q&A"):
@@ -2118,27 +2198,28 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
                     outputs=[status_qa, chatbot, qa_progress, session_state],
                 )
 
-            # ── Export Button Wiring ─────────────────────────────────────────────
-            export_transcript_btn.click(
-                fn=handle_export_transcript,
-                inputs=[session_state],
-                outputs=[transcript_file],
-            )
-            export_summary_btn.click(
-                fn=handle_export_summary,
-                inputs=[session_state],
-                outputs=[summary_file],
-            )
-            export_json_btn.click(
-                fn=handle_export_session_json,
-                inputs=[session_state],
-                outputs=[session_file],
-            )
-            export_chat_btn.click(
-                fn=handle_export_chat,
-                inputs=[session_state],
-                outputs=[chat_file],
-            )
+                export_chat_btn.click(
+                    fn=handle_export_chat,
+                    inputs=[session_state],
+                    outputs=[chat_file],
+                )
+
+            # ── Tab 3: Settings & Cache ──────────────────────────────────────
+            with gr.TabItem("⚙️ Settings & Cache"):
+                cache_stats_md = gr.Markdown(get_cache_stats())
+                with gr.Row():
+                    refresh_cache_btn = gr.Button("🔄 Refresh Stats")
+                    clear_cache_btn = gr.Button("🗑️ Clear All Cache", variant="stop")
+                cache_msg = gr.Label(label="Operation Status")
+
+                refresh_cache_btn.click(
+                    fn=lambda: gr.Markdown(get_cache_stats()),
+                    outputs=[cache_stats_md],
+                )
+                clear_cache_btn.click(
+                    fn=lambda: (clear_cache(), get_cache_stats()),
+                    outputs=[cache_msg, cache_stats_md],
+                )
 
     return interface
 

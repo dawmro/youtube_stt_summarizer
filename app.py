@@ -39,6 +39,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.llms import Ollama
+from rank_bm25 import BM25Okapi
 
 
 # =============================================================================
@@ -68,11 +69,11 @@ class AppConfig:
     """
 
     base_dir: Path = Path(__file__).resolve().parent
-    llm_model: str = "llama3.2:3b" # "llama3.1:8b-instruct-q8_0"
+    llm_model: str = "llama3.1:8b-instruct-q8_0"
     embedding_model: str = "mxbai-embed-large" # "nomic-embed-text" or "mxbai-embed-large"
     ollama_base_url: str = "http://localhost:11434"
 
-    llm_context_limit: int = 4096 # 8192
+    llm_context_limit: int = 8192
     safety_margin: int = 1024
 
     summary_chunk_overlap_tokens: int = 256
@@ -82,6 +83,9 @@ class AppConfig:
     semantic_chunk_threshold: float = 0.75      # cosine similarity merge threshold
     semantic_chunk_max_chars: int = 1200        # hard cap to prevent oversized embeddings
     retrieval_top_k: int = 4
+    # Hybrid search tuning parameters
+    hybrid_dense_weight: float = 0.7       # 0.0 = pure BM25, 1.0 = pure FAISS
+    hybrid_top_k_candidates: int = 8       # fetch more candidates before fusion
 
     whisper_model_size: str = "small"   # "small", "medium", "large-v3"
     whisper_device: str = "cpu"         # "cpu" or "cuda"
@@ -1473,6 +1477,97 @@ def get_or_create_faiss(state: SessionState, runtime: RuntimeDeps) -> FAISS:
     return faiss_index
 
 # =============================================================================
+# HYBRID SEARCH FUNCTIONS
+# =============================================================================
+
+@dataclass
+class HybridDoc:
+    """Lightweight document proxy compatible with build_context_with_sources."""
+    page_content: str
+    metadata: Dict[str, Any]
+
+
+def tokenize_text(text: str) -> List[str]:
+    """Simple lowercase alphanumeric tokenizer for BM25."""
+    return re.findall(r"\b\w+\b", text.lower())
+
+
+def build_bm25_index(chunks: List[RetrievalChunk]) -> BM25Okapi:
+    """Build a lightweight BM25 index from retrieval chunks."""
+    tokenized_corpus = [tokenize_text(c.text) for c in chunks]
+    return BM25Okapi(tokenized_corpus)
+
+
+def hybrid_search(
+    question: str,
+    faiss_index: FAISS,
+    chunks: List[RetrievalChunk],
+    embeddings: OllamaEmbeddings,
+    top_k: int = CFG.retrieval_top_k,
+    candidates: int = CFG.hybrid_top_k_candidates,
+    alpha: float = CFG.hybrid_dense_weight,
+) -> List[HybridDoc]:
+    """Run dense + sparse retrieval and fuse scores via weighted normalization.
+    
+    BM25 is rebuilt in-memory per query (<50ms for ~200 chunks) to guarantee
+    sync with the active FAISS index and avoid pickle/cache complexity.
+    """
+    if not chunks:
+        return []
+
+    # ── 1. Dense FAISS search ──────────────────────────────────────────────
+    dense_docs = faiss_index.similarity_search_with_score(question, k=candidates)
+    dense_scores = [score for _, score in dense_docs]
+    
+    # FAISS returns L2 distance (lower = better). Convert to similarity [0,1]
+    if dense_scores:
+        min_d, max_d = min(dense_scores), max(dense_scores)
+        norm_dense = [
+            1.0 - ((s - min_d) / (max_d - min_d)) if max_d > min_d else 1.0 
+            for s in dense_scores
+        ]
+    else:
+        norm_dense = []
+
+    # ── 2. Sparse BM25 search ──────────────────────────────────────────────
+    bm25 = build_bm25_index(chunks)
+    query_tokens = tokenize_text(question)
+    # .tolist() converts the NumPy array to a standard Python list
+    bm25_scores = bm25.get_scores(query_tokens).tolist()
+    
+    # Normalize BM25 scores to [0,1]
+    max_bm25 = max(bm25_scores) if bm25_scores else 0.0
+    norm_sparse = [s / max_bm25 if max_bm25 > 0 else 0.0 for s in bm25_scores]
+
+    # ── 3. Score Fusion ────────────────────────────────────────────────────
+    chunk_id_to_idx = {c.chunk_id: i for i, c in enumerate(chunks)}
+    fused_scores: Dict[int, float] = {}
+
+    for (doc, _), nd in zip(dense_docs, norm_dense):
+        cid = doc.metadata.get("chunk_id")
+        if cid in chunk_id_to_idx:
+            idx = chunk_id_to_idx[cid]
+            fused_scores[idx] = fused_scores.get(idx, 0.0) + (alpha * nd)
+
+    for idx, ns in enumerate(norm_sparse):
+        fused_scores[idx] = fused_scores.get(idx, 0.0) + ((1.0 - alpha) * ns)
+
+    # ── 4. Rank & Return Top-K ─────────────────────────────────────────────
+    ranked_indices = sorted(fused_scores.keys(), key=lambda i: fused_scores[i], reverse=True)[:top_k]
+    
+    results = []
+    for idx in ranked_indices:
+        chunk = chunks[idx]
+        results.append(HybridDoc(
+            page_content=chunk.text,
+            metadata={"start": chunk.start, "end": chunk.end, "chunk_id": chunk.chunk_id, "hybrid_score": fused_scores[idx]}
+        ))
+        
+    logger.info("Hybrid search complete: %d candidates → %d fused results", len(fused_scores), len(results))
+    return results
+
+
+# =============================================================================
 # Q&A CONTEXT BUILDER
 # =============================================================================
 
@@ -1853,14 +1948,19 @@ def _make_qa_handler(runtime: RuntimeDeps):
             )
             faiss_index = get_or_create_faiss(state, runtime)
 
-            # ── Similarity search ────────────────────────────────────────────
+            # ── Hybrid Dense + BM25 search ───────────────────────────────────
             progress = 80
             yield (
-                "🔎 Searching transcript for relevant context...",
+                "🔎 Running hybrid dense+BM25 search...",
                 state.chat_history, progress, state.to_gradio(),
             )
-            with log_time("FAISS similarity search"):
-                docs = faiss_index.similarity_search(question, k=CFG.retrieval_top_k)
+            with log_time("Hybrid dense+BM25 search"):
+                docs = hybrid_search(
+                    question=question,
+                    faiss_index=faiss_index,
+                    chunks=state.chunks,
+                    embeddings=runtime.embeddings,
+                )
 
             if not docs:
                 state.chat_history.append({"role": "user", "content": question})

@@ -65,32 +65,31 @@ class AppConfig:
     cache correctness depends on runtime settings. When model or chunking
     settings change, cache keys should change too.
 
-    Note: embed_chunk_size is measured in characters, not tokens.
     """
 
     base_dir: Path = Path(__file__).resolve().parent
-    llm_model: str = "llama3.1:8b-instruct-q8_0"
+    llm_model: str = "llama3.2:3b" # "llama3.1:8b-instruct-q8_0"
     embedding_model: str = "mxbai-embed-large" # "nomic-embed-text" or "mxbai-embed-large"
     ollama_base_url: str = "http://localhost:11434"
 
-    llm_context_limit: int = 8192
+    llm_context_limit: int = 4096 # 8192
     safety_margin: int = 1024
 
     summary_chunk_overlap_tokens: int = 256
     max_summary_passes: int = 4
 
-    # Character-based limit for retrieval chunks (not token-based).
-    embed_chunk_size: int = 1000
-    embed_chunk_overlap_segments: int = 1
+    # Character-based limit for semantic chunking parameters
+    semantic_chunk_threshold: float = 0.75      # cosine similarity merge threshold
+    semantic_chunk_max_chars: int = 1200        # hard cap to prevent oversized embeddings
     retrieval_top_k: int = 4
 
     whisper_model_size: str = "small"   # "small", "medium", "large-v3"
     whisper_device: str = "cpu"         # "cpu" or "cuda"
     whisper_compute_type: str = "int8"  # "int8" or "float16"
     whisper_language: Optional[str] = None
-    whisper_beam_size: int = 1          # usually 1-5 
-    whisper_vad_filter: bool = False    # quality: True, speed: False
-    whisper_condition_on_previous_text: bool = False    # quality: True, speed: False
+    whisper_beam_size: int = 5          # usually 1-5 
+    whisper_vad_filter: bool = True    # quality: True, speed: False
+    whisper_condition_on_previous_text: bool = True    # quality: True, speed: False
     # word_timestamps=True triggers a DTW (Dynamic Time Warping) alignment pass
     # after every decoded segment to pin each word to its exact audio position.
     # On CPU this increases transcription time. 
@@ -102,7 +101,7 @@ class AppConfig:
     summary_prompt_version: str = "summary-v1"
     retrieval_prompt_version: str = "qa-with-timestamps-v1"
     transcript_schema_version: str = "timestamped-transcript-v1"
-    retrieval_schema_version: str = "timestamped-retrieval-v1"
+    retrieval_schema_version: str = "timestamped-retrieval-v2"
 
     @property
     def max_transcript_tokens(self) -> int:
@@ -195,8 +194,8 @@ def current_summary_config() -> Dict[str, Any]:
 def current_retrieval_config() -> Dict[str, Any]:
     return {
         "embedding_model": CFG.embedding_model,
-        "embed_chunk_size": CFG.embed_chunk_size,
-        "embed_chunk_overlap_segments": CFG.embed_chunk_overlap_segments,
+        "semantic_chunk_threshold": CFG.semantic_chunk_threshold,
+        "semantic_chunk_max_chars": CFG.semantic_chunk_max_chars,
         "retrieval_prompt_version": CFG.retrieval_prompt_version,
         "retrieval_schema_version": CFG.retrieval_schema_version,
         "retrieval_top_k": CFG.retrieval_top_k,
@@ -1028,48 +1027,62 @@ class RetrievalChunk:
 # RETRIEVAL CHUNKING
 # =============================================================================
 
-def build_retrieval_chunks(segments: List[TranscriptSegment]) -> List[RetrievalChunk]:
-    """Group TranscriptSegment objects into RetrievalChunk instances.
+def cosine_similarity(a: List[float], b: List[float]) -> float:
+    """Compute cosine similarity between two embedding vectors."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(y * y for y in b) ** 0.5
+    return dot / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0.0
 
-    Chunking strategy:
-    - Accumulate segments until the combined text would exceed embed_chunk_size
-      characters (CFG.embed_chunk_size).
-    - After emitting a chunk, step back by embed_chunk_overlap_segments so the
-      next chunk starts overlap-many segments before the current boundary.
-      This prevents context from being silently cut at chunk edges.
-    - Segments whose text is empty or whitespace-only are skipped entirely.
-    - chunk_id values are assigned sequentially starting from 0.
 
-    Returns an empty list when all input segments have empty text.
+def build_retrieval_chunks(
+    segments: List[TranscriptSegment],
+    embeddings: OllamaEmbeddings,
+) -> List[RetrievalChunk]:
+    """Group TranscriptSegment objects into semantically coherent RetrievalChunks.
+    
+    Strategy:
+    1. Filter segments with usable text.
+    2. Batch-embed each segment.
+    3. Merge adjacent segments when cosine similarity >= threshold AND
+       combined length <= semantic_chunk_max_chars.
+    4. Preserve exact timestamp boundaries & segment_ids for citation rendering.
     """
-    # Filter out segments with no usable text upfront.
     valid = [s for s in segments if s.text.strip()]
     if not valid:
         return []
+
+    # Batch embed all valid segments (Ollama handles batching efficiently)
+    segment_texts = [s.text for s in valid]
+    with log_time("embed segments for semantic chunking"):
+        segment_embeddings = embeddings.embed_documents(segment_texts)
 
     chunks: List[RetrievalChunk] = []
     chunk_id = 0
     idx = 0
 
     while idx < len(valid):
-        window: List[TranscriptSegment] = []
-        char_count = 0
+        # Start a new chunk with the current segment
+        window: List[TranscriptSegment] = [valid[idx]]
+        window_emb = segment_embeddings[idx]
+        char_count = len(valid[idx].text)
+        j = idx + 1
 
-        # Grow the window until the next segment would push us over the budget.
-        j = idx
+        # Greedily merge forward while semantic similarity & length allow
         while j < len(valid):
-            seg = valid[j]
-            seg_len = len(seg.text)
-            if window and char_count + seg_len > CFG.embed_chunk_size:
-                break
-            window.append(seg)
-            char_count += seg_len
-            j += 1
+            next_seg = valid[j]
+            next_emb = segment_embeddings[j]
+            next_len = len(next_seg.text)
 
-        if not window:
-            # Safety: single segment longer than the budget — include it alone.
-            window = [valid[idx]]
-            j = idx + 1
+            sim = cosine_similarity(window_emb, next_emb)
+            if sim >= CFG.semantic_chunk_threshold and (char_count + next_len) <= CFG.semantic_chunk_max_chars:
+                window.append(next_seg)
+                char_count += next_len
+                # Update window embedding to running average for next comparison
+                window_emb = [(a + b) / 2 for a, b in zip(window_emb, next_emb)]
+                j += 1
+            else:
+                break
 
         chunks.append(
             RetrievalChunk(
@@ -1081,12 +1094,9 @@ def build_retrieval_chunks(segments: List[TranscriptSegment]) -> List[RetrievalC
             )
         )
         chunk_id += 1
+        idx = j  # Jump to first unmerged segment
 
-        # Slide the window forward, stepping back by the overlap amount so the
-        # next chunk re-uses the last overlap-many segments of this one.
-        advance = max(1, len(window) - CFG.embed_chunk_overlap_segments)
-        idx += advance
-
+    logger.info("Semantic chunking complete: %d segments → %d chunks", len(valid), len(chunks))
     return chunks
 
 
@@ -1388,7 +1398,7 @@ def load_retrieval_cache(
         return None
 
 
-def get_or_create_chunks(state: SessionState) -> None:
+def get_or_create_chunks(state: SessionState, runtime: RuntimeDeps) -> None:
     """Populate state.chunks from cache or by building from transcript segments.
 
     Mutates state in place.  A no-op when state.chunks is already set (e.g.
@@ -1413,7 +1423,7 @@ def get_or_create_chunks(state: SessionState) -> None:
         len(state.transcript_segments),
     )
     with log_time("build_retrieval_chunks"):
-        state.chunks = build_retrieval_chunks(state.transcript_segments)
+        state.chunks = build_retrieval_chunks(state.transcript_segments, runtime.embeddings)
     logger.info("Built %d retrieval chunks.", len(state.chunks))
 
 
@@ -1425,7 +1435,7 @@ def get_or_create_faiss(state: SessionState, runtime: RuntimeDeps) -> FAISS:
         2. Disk cache — load_retrieval_cache finds matching files on disk.
         3. Build fresh — embed state.chunks, build the index, persist to disk.
 
-    Callers must call get_or_create_chunks(state) before this function so
+    Callers must call get_or_create_chunks(state, runtime) before this function so
     state.chunks is populated for layers 2 and 3.
     """
     if state.faiss_index is not None:
@@ -1442,7 +1452,7 @@ def get_or_create_faiss(state: SessionState, runtime: RuntimeDeps) -> FAISS:
     if not state.chunks:
         raise RuntimeError(
             "Cannot build FAISS index: state.chunks is empty. "
-            "Call get_or_create_chunks(state) first."
+            "Call get_or_create_chunks(state, runtime) first."
         )
 
     logger.info("Building FAISS index from %d chunks...", len(state.chunks))
@@ -1833,7 +1843,7 @@ def _make_qa_handler(runtime: RuntimeDeps):
                 "🧩 Preparing timestamp-aware retrieval chunks...",
                 "", progress, state.to_gradio(),
             )
-            get_or_create_chunks(state)
+            get_or_create_chunks(state, runtime)
 
             # ── FAISS index ──────────────────────────────────────────────────
             progress = 65

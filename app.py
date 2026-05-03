@@ -22,6 +22,7 @@ import re
 import requests
 import subprocess
 import shutil
+import sqlite3
 import tempfile
 import time
 from contextlib import contextmanager
@@ -154,12 +155,80 @@ class CachePaths:
 
 CFG = AppConfig()
 PATHS = CachePaths.from_base_dir(CFG.base_dir)
+DB_PATH = PATHS.root / "app_data.db"
 TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
 
 # Compiled patterns used by render_clickable_answer.
 # Defined at module level so they are compiled once, not per call.
 SOURCE_GROUP_PATTERN = re.compile(r"\[((?:S\d+\s*(?:,\s*S\d+\s*)*))\]")
 SOURCE_SINGLE_PATTERN = re.compile(r"(?<!\[)(S\d+)(?!\])")
+
+
+# =============================================================================
+# Database Manager & Schema
+# =============================================================================
+
+@contextmanager
+def get_db():
+    """Thread-safe SQLite connection manager for Gradio's async event loop.
+    
+    Design Rationale:
+    - Short-lived connections prevent long-running locks that block concurrent UI events.
+    - check_same_thread=False is required because Gradio routes requests across threads.
+    - Explicit commit/rollback ensures partial writes never corrupt the cache.
+    """
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db() -> None:
+    """Create cache tables and indexes if they don't exist.
+    
+    Schema Design:
+    - videos: Lightweight registry for observability & future library UI.
+    - transcripts: Stores full text + JSON-serialized segments. Config hash
+      filtering guarantees automatic invalidation when Whisper settings change.
+    - summaries: Stores generated summaries keyed by video, transcript hash,
+      mode (direct/chunked), and summary config hash. Composite index matches
+      the exact WHERE clause used in load_cached_summary for O(1) lookups.
+    """
+    with get_db() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS videos (
+                video_id TEXT PRIMARY KEY,
+                url TEXT,
+                indexed_at REAL
+            );
+            CREATE TABLE IF NOT EXISTS transcripts (
+                video_id TEXT PRIMARY KEY,
+                transcript TEXT,
+                transcript_hash TEXT,
+                segments_json TEXT,
+                stt_config_hash TEXT,
+                saved_at REAL,
+                FOREIGN KEY(video_id) REFERENCES videos(video_id)
+            );
+            CREATE TABLE IF NOT EXISTS summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                video_id TEXT,
+                transcript_hash TEXT,
+                mode TEXT,
+                summary TEXT,
+                summary_config_hash TEXT,
+                saved_at REAL,
+                FOREIGN KEY(video_id) REFERENCES videos(video_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_summaries_lookup
+                ON summaries(video_id, transcript_hash, mode, summary_config_hash);
+        """)
 
 
 # =============================================================================
@@ -597,43 +666,52 @@ Answer:""",
 # TRANSCRIPT CACHE AND PIPELINE
 # =============================================================================
 
-def transcript_record_path(video_id: str) -> Path:
-    return PATHS.transcript / f"{video_id}__{STT_CONFIG_HASH}.json"
-
-
 def load_cached_transcript(
     video_id: str,
 ) -> Optional[Tuple[str, List[TranscriptSegment], str]]:
-    """Load transcript cache when the STT config hash (encoded in filename) matches."""
-    data = read_json(transcript_record_path(video_id))
-    if not data:
+    """Load transcript from SQLite when STT config hash matches."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT transcript, transcript_hash, segments_json FROM transcripts "
+            "WHERE video_id = ? AND stt_config_hash = ?",
+            (video_id, STT_CONFIG_HASH)
+        ).fetchone()
+    if not row:
         return None
-    transcript = str(data.get("transcript", "")).strip()
-    raw_segments = data.get("segments")
-    if not transcript or not isinstance(raw_segments, list) or not raw_segments:
+    
+    # Safely deserialize segment list; skip corrupted records gracefully
+    try:
+        segments_data = json.loads(row["segments_json"])
+        segments = [TranscriptSegment.from_dict(s) for s in segments_data if isinstance(s, dict)]
+    except (json.JSONDecodeError, KeyError):
+        logger.warning("Corrupted segments_json for %s — treating as cache miss.", video_id)
         return None
-    segments = [TranscriptSegment.from_dict(item) for item in raw_segments]
-    transcript_hash_value = data.get("transcript_hash") or text_hash(transcript)
-    return transcript, segments, transcript_hash_value
+        
+    return row["transcript"], segments, row["transcript_hash"]
 
 
 def save_transcript(
     video_id: str, transcript: str, segments: List[TranscriptSegment]
 ) -> None:
-    """Persist transcript text and timestamped segments together."""
-    write_json_atomic(
-        transcript_record_path(video_id),
-        {
-            "video_id": video_id,
-            "transcript": transcript,
-            "transcript_hash": text_hash(transcript),
-            "segments": [seg.to_dict() for seg in segments],
-            "transcript_schema_version": CFG.transcript_schema_version,
-            "stt_config_hash": STT_CONFIG_HASH,
-            "stt_config": current_stt_config(),
-            "saved_at": time.time(),
-        },
-    )
+    """Persist transcript and segments to SQLite with atomic upsert."""
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO videos (video_id, indexed_at) VALUES (?, ?)",
+            (video_id, time.time())
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO transcripts "
+            "(video_id, transcript, transcript_hash, segments_json, stt_config_hash, saved_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                video_id,
+                transcript,
+                text_hash(transcript),
+                json.dumps([s.to_dict() for s in segments]),
+                STT_CONFIG_HASH,
+                time.time()
+            )
+        )
 
 
 def transcribe_audio(
@@ -942,67 +1020,31 @@ def summarize_transcript_stream(
 # SUMMARY CACHE
 # =============================================================================
 
-def summary_record_path(
-    video_id: str, transcript_hash_value: str, mode: str
-) -> Path:
-    """Derive the cache file path for a summary.
-
-    Three inputs are encoded in the filename:
-        - video_id            — identifies the video.
-        - mode                — "direct" or "chunked"; kept separate so a
-                                change in strategy forces a fresh generation.
-        - SUMMARY_CONFIG_HASH — invalidates the cache when the LLM model,
-                                context limits, or prompt version change.
-        - transcript_hash_value — invalidates the cache when the transcript
-                                  content changes (e.g. different Whisper run).
-
-    Pattern: <video_id>__<mode>__<summary_config_hash>__<transcript_hash>.json
-    """
-    return (
-        PATHS.summary
-        / f"{video_id}__{mode}__{SUMMARY_CONFIG_HASH}__{transcript_hash_value}.json"
-    )
-
 
 def save_summary(
     video_id: str, transcript_hash_value: str, mode: str, summary: str
 ) -> None:
-    """Persist summary output tied to transcript content and summary strategy.
-
-    The mode field ("direct" / "chunked") is stored in the payload for
-    observability — it lets you tell at a glance which strategy produced the
-    cached result without reading the content.
-    """
-    write_json_atomic(
-        summary_record_path(video_id, transcript_hash_value, mode),
-        {
-            "video_id": video_id,
-            "transcript_hash": transcript_hash_value,
-            "summary": summary,
-            "mode": mode,
-            "summary_config_hash": SUMMARY_CONFIG_HASH,
-            "summary_config": current_summary_config(),
-            "saved_at": time.time(),
-        },
-    )
+    """Persist summary to SQLite. Inserts new row to preserve history."""
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO summaries "
+            "(video_id, transcript_hash, mode, summary, summary_config_hash, saved_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (video_id, transcript_hash_value, mode, summary, SUMMARY_CONFIG_HASH, time.time())
+        )
 
 
 def load_cached_summary(
     video_id: str, transcript_hash_value: str, mode: str
 ) -> Optional[str]:
-    """Load summary cache when the filename (config + transcript hash) matches.
-
-    No redundant in-body hash checks: the filename already encodes the full
-    cache key so a file that exists at the derived path is guaranteed to match
-    the current settings and transcript content.
-
-    Returns the summary string or None on a cache miss.
-    """
-    data = read_json(summary_record_path(video_id, transcript_hash_value, mode))
-    if not data:
-        return None
-    summary = str(data.get("summary", "")).strip()
-    return summary or None
+    """Load latest matching summary from SQLite using indexed lookup."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT summary FROM summaries WHERE video_id = ? AND transcript_hash = ? "
+            "AND mode = ? AND summary_config_hash = ? ORDER BY saved_at DESC LIMIT 1",
+            (video_id, transcript_hash_value, mode, SUMMARY_CONFIG_HASH)
+        ).fetchone()
+    return row["summary"] if row else None
 
 
 # =============================================================================
@@ -2511,6 +2553,7 @@ def main() -> None:
     straightforward to unit-test individual functions.
     """
     PATHS.ensure()
+    init_db()
     runtime = build_runtime()
     interface = build_interface(runtime)
     interface.queue(default_concurrency_limit=1)

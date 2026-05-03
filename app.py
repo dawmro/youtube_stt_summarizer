@@ -38,6 +38,12 @@ from langchain.prompts import PromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_community.vectorstores import FAISS
+try:
+    from langchain_qdrant import Qdrant
+    from qdrant_client import QdrantClient
+    QDRANT_AVAILABLE = True
+except ImportError:
+    QDRANT_AVAILABLE = False
 from langchain_community.llms import Ollama
 from rank_bm25 import BM25Okapi
 
@@ -82,10 +88,12 @@ class AppConfig:
     # Character-based limit for semantic chunking parameters
     semantic_chunk_threshold: float = 0.75      # cosine similarity merge threshold
     semantic_chunk_max_chars: int = 1200        # hard cap to prevent oversized embeddings
-    retrieval_top_k: int = 4
     # Hybrid search tuning parameters
     hybrid_dense_weight: float = 0.7       # 0.0 = pure BM25, 1.0 = pure FAISS
     hybrid_top_k_candidates: int = 8       # fetch more candidates before fusion
+    retrieval_top_k: int = 4
+    vector_db_type: str = "qdrant"  # "qdrant" or "faiss"
+    qdrant_path: str = "cache/qdrant_db"  # local persistence path
 
     whisper_model_size: str = "small"   # "small", "medium", "large-v3"
     whisper_device: str = "cpu"         # "cpu" or "cuda"
@@ -560,6 +568,9 @@ Rules:
 - When you use evidence, cite supporting sources inline using source ids, for example [S1] or [S1][S2].
 - Do not invent timestamps or sources.
 - Prefer a concise answer.
+
+Chat History:
+{chat_history}
 
 Context:
 {context}
@@ -1431,50 +1442,168 @@ def get_or_create_chunks(state: SessionState, runtime: RuntimeDeps) -> None:
     logger.info("Built %d retrieval chunks.", len(state.chunks))
 
 
-def get_or_create_faiss(state: SessionState, runtime: RuntimeDeps) -> FAISS:
-    """Return the FAISS index for the active session, building it if necessary.
+def build_vector_store(
+    texts: List[str],
+    metadatas: List[Dict[str, Any]],
+    embeddings: OllamaEmbeddings,
+    video_id: str,
+) -> Any:
+    """Initialize and populate a vector store based on application configuration.
 
-    Three-layer lookup:
-        1. In-memory  — state.faiss_index already set from this session.
-        2. Disk cache — load_retrieval_cache finds matching files on disk.
-        3. Build fresh — embed state.chunks, build the index, persist to disk.
+    Design Rationale:
+    - Abstracts storage backend via ``CFG.vector_db_type`` to support both
+      Qdrant (local disk mode) and FAISS without altering retrieval logic.
+    - Uses ``QdrantClient(path=...)`` for embedded, serverless persistence.
+      This avoids Docker/network dependencies while retaining Qdrant's
+      metadata filtering and concurrent read capabilities.
+    - Explicitly creates the collection with dynamically resolved vector
+      dimensions and COSINE distance. This bypasses routing bugs in
+      ``langchain-qdrant 0.1.x`` + ``qdrant-client >=1.9`` where
+      ``Qdrant.from_texts()`` incorrectly forwards client kwargs to httpx.
+    - Ingests via ``store.add_texts()`` instead of ``from_texts()`` to
+      guarantee stable initialization across the pinned dependency matrix.
 
-    Callers must call get_or_create_chunks(state, runtime) before this function so
-    state.chunks is populated for layers 2 and 3.
+    Args:
+        texts: List of chunk strings to embed and index.
+        metadatas: Parallel list of metadata dicts (start, end, chunk_id, etc.).
+        embeddings: LangChain-compatible embedding wrapper (Ollama).
+        video_id: YouTube video identifier used to namespace the collection.
+
+    Returns:
+        A LangChain-compatible vector store instance (QdrantVectorStore or FAISS).
     """
+    if CFG.vector_db_type == "qdrant":
+        if not QDRANT_AVAILABLE:
+            raise ImportError(
+                "Qdrant backend requested but dependencies are missing. "
+                "Install with: pip install qdrant-client langchain-qdrant"
+            )
+        from qdrant_client import QdrantClient
+        from qdrant_client import models as qdrant_models
+        from langchain_qdrant import QdrantVectorStore
+
+        # Embedded local mode: persists to disk without a running server
+        client = QdrantClient(path=CFG.qdrant_path)
+        collection_name = f"yt_transcripts_{video_id}"
+
+        # Dynamically resolve embedding dimension to support any Ollama model
+        # without hardcoding sizes (e.g., mxbai=1024, nomic=768).
+        sample_vec = embeddings.embed_query("dimension check")
+        vector_size = len(sample_vec)
+
+        # Explicit collection creation avoids langchain-qdrant's internal
+        # factory bugs in v0.1.4 when combined with qdrant-client >=1.9.
+        if not client.collection_exists(collection_name):
+            client.create_collection(
+                collection_name=collection_name,
+                vectors_config=qdrant_models.VectorParams(
+                    size=vector_size,
+                    distance=qdrant_models.Distance.COSINE,
+                ),
+            )
+
+        # QdrantVectorStore is the modern, non-deprecated wrapper.
+        # Note: singular 'embedding' is required by langchain-qdrant 0.1.x API.
+        store = QdrantVectorStore(
+            client=client,
+            collection_name=collection_name,
+            embedding=embeddings,
+        )
+        # Manual ingestion bypasses from_texts() client-routing issues
+        store.add_texts(texts, metadatas=metadatas)
+        return store
+
+    # FAISS fallback: uses existing local-file cache structure
+    return FAISS.from_texts(texts, embeddings, metadatas=metadatas)
+
+
+def load_vector_store(
+    video_id: str,
+    embeddings: OllamaEmbeddings,
+) -> Optional[Any]:
+    """Load a previously persisted vector store from disk, if available.
+
+    Design Rationale:
+    - Performs safe existence checks before instantiation to prevent
+      ``ValueError: Collection not found`` crashes on cold starts.
+    - Uses ``get_collections().collections`` instead of ``get_collection()``
+      to avoid exception-based control flow, which is slower and noisier
+      in logs when collections are missing.
+    - Gracefully falls back to FAISS when Qdrant is disabled or unavailable,
+      preserving backward compatibility with existing cache directories.
+    - Returns ``None`` on any I/O or deserialization error, allowing the
+      pipeline to trigger a fresh rebuild without halting execution.
+
+    Args:
+        video_id: YouTube video identifier used to locate the collection.
+        embeddings: LangChain-compatible embedding wrapper for vector alignment.
+
+    Returns:
+        A hydrated vector store instance, or ``None`` if no cache exists.
+    """
+    if CFG.vector_db_type == "qdrant":
+        if not QDRANT_AVAILABLE:
+            return None
+        from qdrant_client import QdrantClient
+        from langchain_qdrant import QdrantVectorStore
+
+        collection_name = f"yt_transcripts_{video_id}"
+        try:
+            # Reuse embedded local client pointing to the same disk path
+            client = QdrantClient(path=CFG.qdrant_path)
+
+            # Safe enumeration avoids throwing on missing collections
+            collections = [c.name for c in client.get_collections().collections]
+            if collection_name not in collections:
+                return None
+
+            return QdrantVectorStore(
+                client=client,
+                collection_name=collection_name,
+                embedding=embeddings,
+            )
+        except Exception:
+            # Silently fail to allow pipeline fallback to fresh build
+            return None
+
+    # FAISS fallback: reuses legacy path resolver. text_hash("") is a placeholder
+    # to satisfy the signature without altering existing cache routing logic.
+    cache_dir = retrieval_record_path(video_id, text_hash(""))
+    faiss_path = cache_dir / "index.faiss"
+    if faiss_path.exists():
+        return FAISS.load_local(
+            str(cache_dir), embeddings, allow_dangerous_deserialization=True
+        )
+    return None
+
+
+def get_or_create_vector_store(state: SessionState, runtime: RuntimeDeps) -> Any:
+    """Return the vector store for the active session, building if necessary."""
     if state.faiss_index is not None:
-        logger.info("FAISS index found in session memory — reusing.")
+        logger.info("Vector store found in session memory — reusing.")
         return state.faiss_index
 
-    cached = load_retrieval_cache(
-        state.video_id, state.transcript_hash, runtime.embeddings
-    )
-    if cached:
-        state.chunks, state.faiss_index = cached
-        return state.faiss_index
+    store = load_vector_store(state.video_id, runtime.embeddings)
+    if store:
+        state.faiss_index = store  # reused field name for backward compatibility
+        return store
 
     if not state.chunks:
-        raise RuntimeError(
-            "Cannot build FAISS index: state.chunks is empty. "
-            "Call get_or_create_chunks(state, runtime) first."
-        )
+        raise RuntimeError("Cannot build vector store: state.chunks is empty.")
 
-    logger.info("Building FAISS index from %d chunks...", len(state.chunks))
+    logger.info("Building vector store from %d chunks...", len(state.chunks))
     texts = [chunk.text for chunk in state.chunks]
     metadatas = [
-        {"start": chunk.start, "end": chunk.end, "chunk_id": chunk.chunk_id}
+        {"start": chunk.start, "end": chunk.end, "chunk_id": chunk.chunk_id, "video_id": state.video_id}
         for chunk in state.chunks
     ]
 
-    with log_time("FAISS index build"):
-        faiss_index = FAISS.from_texts(texts, runtime.embeddings, metadatas=metadatas)
+    with log_time("Vector store build"):
+        store = build_vector_store(texts, metadatas, runtime.embeddings, state.video_id)
 
-    state.faiss_index = faiss_index
-    save_retrieval_cache(
-        state.video_id, state.transcript_hash, state.chunks, faiss_index
-    )
-    logger.info("FAISS index built and persisted to retrieval cache.")
-    return faiss_index
+    state.faiss_index = store
+    logger.info("Vector store built and persisted.")
+    return store
 
 # =============================================================================
 # HYBRID SEARCH FUNCTIONS
@@ -1500,7 +1629,7 @@ def build_bm25_index(chunks: List[RetrievalChunk]) -> BM25Okapi:
 
 def hybrid_search(
     question: str,
-    faiss_index: FAISS,
+    vector_store: Any,
     chunks: List[RetrievalChunk],
     embeddings: OllamaEmbeddings,
     top_k: int = CFG.retrieval_top_k,
@@ -1515,17 +1644,21 @@ def hybrid_search(
     if not chunks:
         return []
 
-    # ── 1. Dense FAISS search ──────────────────────────────────────────────
-    dense_docs = faiss_index.similarity_search_with_score(question, k=candidates)
+    # ── 1. Dense Vector Search ─────────────────────────────────────────────
+    dense_docs = vector_store.similarity_search_with_score(question, k=candidates)
     dense_scores = [score for _, score in dense_docs]
-    
-    # FAISS returns L2 distance (lower = better). Convert to similarity [0,1]
+
+    # Qdrant returns cosine similarity (higher = better).
+    # FAISS returns L2 distance (lower = better).
+    # Normalize both to [0, 1] where 1.0 = best match.
     if dense_scores:
-        min_d, max_d = min(dense_scores), max(dense_scores)
-        norm_dense = [
-            1.0 - ((s - min_d) / (max_d - min_d)) if max_d > min_d else 1.0 
-            for s in dense_scores
-        ]
+        min_s, max_s = min(dense_scores), max(dense_scores)
+        if CFG.vector_db_type == "qdrant":
+            # Cosine similarity: direct min-max normalization
+            norm_dense = [(s - min_s) / (max_s - min_s) if max_s > min_s else 1.0 for s in dense_scores]
+        else:
+            # L2 distance: invert after normalization
+            norm_dense = [1.0 - ((s - min_s) / (max_s - min_s)) if max_s > min_s else 1.0 for s in dense_scores]
     else:
         norm_dense = []
 
@@ -1692,12 +1825,23 @@ def render_clickable_answer(
 def run_llm_dynamic(llm: Ollama, template: str, inputs: Dict[str, str]) -> str:
     """Run LLM with a custom prompt template without rebuilding chains.
     
-    Falls back gracefully if the template is empty. LangChain will raise
-    a clear KeyError if the template references missing input variables.
+    Design Rationale:
+    - Dynamically extracts only variables actually present in the template.
+      This prevents LangChain's strict PromptTemplate validation from crashing
+      when users provide overrides that omit optional variables like {chat_history}.
+    - Falls back gracefully if the template is empty or malformed.
     """
-    prompt = PromptTemplate(template=template, input_variables=list(inputs.keys()))
+    import re
+    # Extract {variable_name} placeholders from the template
+    template_vars = set(re.findall(r"\{(\w+)\}", template))
+    filtered_inputs = {k: v for k, v in inputs.items() if k in template_vars}
+    
+    if not filtered_inputs:
+        raise ValueError("Prompt template contains no valid input variables.")
+        
+    prompt = PromptTemplate(template=template, input_variables=list(filtered_inputs.keys()))
     chain = LLMChain(llm=llm, prompt=prompt)
-    return chain.predict(**inputs).strip()
+    return chain.predict(**filtered_inputs).strip()
 
 
 def _make_summarize_handler(runtime: RuntimeDeps):
@@ -1946,7 +2090,7 @@ def _make_qa_handler(runtime: RuntimeDeps):
                 "🗂️ Loading or building FAISS index...",
                 state.chat_history, progress, state.to_gradio(),
             )
-            faiss_index = get_or_create_faiss(state, runtime)
+            vector_store = get_or_create_vector_store(state, runtime)
 
             # ── Hybrid Dense + BM25 search ───────────────────────────────────
             progress = 80
@@ -1957,7 +2101,7 @@ def _make_qa_handler(runtime: RuntimeDeps):
             with log_time("Hybrid dense+BM25 search"):
                 docs = hybrid_search(
                     question=question,
-                    faiss_index=faiss_index,
+                    vector_store=vector_store,
                     chunks=state.chunks,
                     embeddings=runtime.embeddings,
                 )

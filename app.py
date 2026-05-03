@@ -1065,6 +1065,7 @@ class RetrievalChunk:
     start: float
     end: float
     segment_ids: List[int]
+    video_id: str = ""
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RetrievalChunk":
@@ -1074,6 +1075,7 @@ class RetrievalChunk:
             start=float(data["start"]),
             end=float(data["end"]),
             segment_ids=[int(x) for x in data.get("segment_ids", [])],
+            video_id=data.get("video_id", ""),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1484,58 +1486,49 @@ def get_or_create_chunks(state: SessionState, runtime: RuntimeDeps) -> None:
     logger.info("Built %d retrieval chunks.", len(state.chunks))
 
 
+_qdrant_client_instance = None
+
+def get_qdrant_client() -> "QdrantClient":
+    """Return a singleton QdrantClient for local disk mode.
+
+    Design Rationale:
+    Qdrant's local backend uses portalocker to prevent concurrent writes.
+    Creating multiple client instances pointing to the same path in one process
+    triggers an AlreadyLocked RuntimeError. Reusing a single instance bypasses
+    the lock check safely while maintaining thread-safe collection routing.
+    """
+    global _qdrant_client_instance
+    if _qdrant_client_instance is None:
+        from qdrant_client import QdrantClient
+
+        qdrant_path = str((CFG.base_dir / CFG.qdrant_path).resolve())
+        logger.info("Initializing singleton Qdrant client at %s", qdrant_path)
+        _qdrant_client_instance = QdrantClient(path=qdrant_path)
+
+    return _qdrant_client_instance
+
+
 def build_vector_store(
     texts: List[str],
     metadatas: List[Dict[str, Any]],
     embeddings: OllamaEmbeddings,
     video_id: str,
 ) -> Any:
-    """Initialize and populate a vector store based on application configuration.
-
-    Design Rationale:
-    - Abstracts storage backend via ``CFG.vector_db_type`` to support both
-      Qdrant (local disk mode) and FAISS without altering retrieval logic.
-    - Uses ``QdrantClient(path=...)`` for embedded, serverless persistence.
-      This avoids Docker/network dependencies while retaining Qdrant's
-      metadata filtering and concurrent read capabilities.
-    - Explicitly creates the collection with dynamically resolved vector
-      dimensions and COSINE distance. This bypasses routing bugs in
-      ``langchain-qdrant 0.1.x`` + ``qdrant-client >=1.9`` where
-      ``Qdrant.from_texts()`` incorrectly forwards client kwargs to httpx.
-    - Ingests via ``store.add_texts()`` instead of ``from_texts()`` to
-      guarantee stable initialization across the pinned dependency matrix.
-
-    Args:
-        texts: List of chunk strings to embed and index.
-        metadatas: Parallel list of metadata dicts (start, end, chunk_id, etc.).
-        embeddings: LangChain-compatible embedding wrapper (Ollama).
-        video_id: YouTube video identifier used to namespace the collection.
-
-    Returns:
-        A LangChain-compatible vector store instance (QdrantVectorStore or FAISS).
-    """
     if CFG.vector_db_type == "qdrant":
         if not QDRANT_AVAILABLE:
-            raise ImportError(
-                "Qdrant backend requested but dependencies are missing. "
-                "Install with: pip install qdrant-client langchain-qdrant"
-            )
-        from qdrant_client import QdrantClient
+            raise ImportError("Install qdrant-client and langchain-qdrant for Qdrant support.")
+
         from qdrant_client import models as qdrant_models
         from langchain_qdrant import QdrantVectorStore
 
-        # Embedded local mode: persists to disk without a running server
-        client = QdrantClient(path=CFG.qdrant_path)
+        client = get_qdrant_client()
         collection_name = f"yt_transcripts_{video_id}"
 
-        # Dynamically resolve embedding dimension to support any Ollama model
-        # without hardcoding sizes (e.g., mxbai=1024, nomic=768).
         sample_vec = embeddings.embed_query("dimension check")
         vector_size = len(sample_vec)
 
-        # Explicit collection creation avoids langchain-qdrant's internal
-        # factory bugs in v0.1.4 when combined with qdrant-client >=1.9.
         if not client.collection_exists(collection_name):
+            logger.info("Creating Qdrant collection %s (dim=%d)", collection_name, vector_size)
             client.create_collection(
                 collection_name=collection_name,
                 vectors_config=qdrant_models.VectorParams(
@@ -1543,19 +1536,17 @@ def build_vector_store(
                     distance=qdrant_models.Distance.COSINE,
                 ),
             )
+        else:
+            logger.info("Reusing existing Qdrant collection %s", collection_name)
 
-        # QdrantVectorStore is the modern, non-deprecated wrapper.
-        # Note: singular 'embedding' is required by langchain-qdrant 0.1.x API.
         store = QdrantVectorStore(
             client=client,
             collection_name=collection_name,
             embedding=embeddings,
         )
-        # Manual ingestion bypasses from_texts() client-routing issues
         store.add_texts(texts, metadatas=metadatas)
         return store
 
-    # FAISS fallback: uses existing local-file cache structure
     return FAISS.from_texts(texts, embeddings, metadatas=metadatas)
 
 
@@ -1563,73 +1554,82 @@ def load_vector_store(
     video_id: str,
     embeddings: OllamaEmbeddings,
 ) -> Optional[Any]:
-    """Load a previously persisted vector store from disk, if available.
-
-    Design Rationale:
-    - Performs safe existence checks before instantiation to prevent
-      ``ValueError: Collection not found`` crashes on cold starts.
-    - Uses ``get_collections().collections`` instead of ``get_collection()``
-      to avoid exception-based control flow, which is slower and noisier
-      in logs when collections are missing.
-    - Gracefully falls back to FAISS when Qdrant is disabled or unavailable,
-      preserving backward compatibility with existing cache directories.
-    - Returns ``None`` on any I/O or deserialization error, allowing the
-      pipeline to trigger a fresh rebuild without halting execution.
-
-    Args:
-        video_id: YouTube video identifier used to locate the collection.
-        embeddings: LangChain-compatible embedding wrapper for vector alignment.
-
-    Returns:
-        A hydrated vector store instance, or ``None`` if no cache exists.
-    """
     if CFG.vector_db_type == "qdrant":
         if not QDRANT_AVAILABLE:
+            logger.warning("Qdrant requested but qdrant dependencies are unavailable.")
             return None
-        from qdrant_client import QdrantClient
+
         from langchain_qdrant import QdrantVectorStore
 
         collection_name = f"yt_transcripts_{video_id}"
         try:
-            # Reuse embedded local client pointing to the same disk path
-            client = QdrantClient(path=CFG.qdrant_path)
-
-            # Safe enumeration avoids throwing on missing collections
-            collections = [c.name for c in client.get_collections().collections]
-            if collection_name not in collections:
+            client = get_qdrant_client()
+            if not client.collection_exists(collection_name):
+                logger.info("Qdrant collection not found for %s: %s", video_id, collection_name)
                 return None
 
+            logger.info("Loaded Qdrant collection for %s: %s", video_id, collection_name)
             return QdrantVectorStore(
                 client=client,
                 collection_name=collection_name,
                 embedding=embeddings,
             )
-        except Exception:
-            # Silently fail to allow pipeline fallback to fresh build
+        except Exception as e:
+            logger.warning("Failed to load Qdrant collection for %s: %s", video_id, e)
             return None
 
-    # FAISS fallback: reuses legacy path resolver. text_hash("") is a placeholder
-    # to satisfy the signature without altering existing cache routing logic.
     cache_dir = retrieval_record_path(video_id, text_hash(""))
     faiss_path = cache_dir / "index.faiss"
     if faiss_path.exists():
-        return FAISS.load_local(
-            str(cache_dir), embeddings, allow_dangerous_deserialization=True
-        )
+        return FAISS.load_local(str(cache_dir), embeddings, allow_dangerous_deserialization=True)
     return None
 
-
 def get_or_create_vector_store(state: SessionState, runtime: RuntimeDeps) -> Any:
-    """Return the vector store for the active session, building if necessary."""
+    """Return the vector store for the active session, building & persisting if necessary.
+    
+    Design Rationale:
+    - 3-layer cache: memory → disk → fresh build.
+    - Ensures chunks.json exists early so cross-video BM25 works even when 
+      the vector store is loaded from cache.
+    - FAISS requires explicit .save_local(). Qdrant local mode auto-persists 
+      to CFG.qdrant_path via the singleton client.
+    - state.faiss_index is a legacy field name but now holds any vector store 
+      type for backward compatibility with SessionState serialization.
+    """
+    # ── 1. Fast path: in-memory cache ──────────────────────────────────────
     if state.faiss_index is not None:
         logger.info("Vector store found in session memory — reusing.")
         return state.faiss_index
 
+    # ── 2. Resolve cache paths once ────────────────────────────────────────
+    cache_dir = retrieval_record_path(state.video_id, state.transcript_hash)
+    chunks_path = cache_dir / "chunks.json"
+
+    # ── 3. Ensure chunks.json exists (critical for cross-video BM25) ───────
+    # Runs idempotently. Guarantees lexical search works even on cache hits.
+    if state.chunks and not chunks_path.exists():
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(
+            chunks_path,
+            {
+                "video_id": state.video_id,
+                "transcript_hash": state.transcript_hash,
+                "chunks": [chunk.to_dict() for chunk in state.chunks],
+                "retrieval_config_hash": RETRIEVAL_CONFIG_HASH,
+                "retrieval_config": current_retrieval_config(),
+                "saved_at": time.time(),
+            },
+        )
+        logger.info("Chunks metadata saved to %s", chunks_path)
+
+    # ── 4. Disk cache check ────────────────────────────────────────────────
     store = load_vector_store(state.video_id, runtime.embeddings)
     if store:
-        state.faiss_index = store  # reused field name for backward compatibility
+        state.faiss_index = store
+        logger.info("Vector store loaded from disk cache.")
         return store
 
+    # ── 5. Build fresh vector store ────────────────────────────────────────
     if not state.chunks:
         raise RuntimeError("Cannot build vector store: state.chunks is empty.")
 
@@ -1643,8 +1643,45 @@ def get_or_create_vector_store(state: SessionState, runtime: RuntimeDeps) -> Any
     with log_time("Vector store build"):
         store = build_vector_store(texts, metadatas, runtime.embeddings, state.video_id)
 
+    # ── 6. Persist artifacts to disk ───────────────────────────────────────
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save chunks.json if step 3 was skipped (e.g., state.chunks was populated late)
+    if not chunks_path.exists():
+        write_json_atomic(
+            chunks_path,
+            {
+                "video_id": state.video_id,
+                "transcript_hash": state.transcript_hash,
+                "chunks": [chunk.to_dict() for chunk in state.chunks],
+                "retrieval_config_hash": RETRIEVAL_CONFIG_HASH,
+                "retrieval_config": current_retrieval_config(),
+                "saved_at": time.time(),
+            },
+        )
+        logger.info("Chunks metadata saved to %s", chunks_path)
+
+    # Backend-specific persistence
+    if CFG.vector_db_type == "faiss":
+        store.save_local(str(cache_dir))
+        logger.info("FAISS index persisted to %s", cache_dir)
+    elif CFG.vector_db_type == "qdrant" and QDRANT_AVAILABLE:
+        client = get_qdrant_client()
+        collection_name = f"yt_transcripts_{state.video_id}"
+        if client.collection_exists(collection_name):
+            logger.info(
+                "Qdrant collection auto-persisted: %s at %s",
+                collection_name,
+                (CFG.base_dir / CFG.qdrant_path).resolve(),
+            )
+        else:
+            logger.warning(
+                "Qdrant collection missing after build: %s. Check disk permissions or path config.",
+                collection_name,
+            )
+
     state.faiss_index = store
-    logger.info("Vector store built and persisted.")
+    logger.info("Vector store built and fully persisted.")
     return store
 
 # =============================================================================
@@ -1743,6 +1780,239 @@ def hybrid_search(
 
 
 # =============================================================================
+# Cross-video retrieval & video library
+# =============================================================================
+
+def get_video_library() -> List[Dict[str, Any]]:
+    """Fetch indexed videos from SQLite for the library UI.
+    
+    Returns a list of dicts sorted by most recently indexed.
+    """
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT video_id, url, indexed_at FROM videos ORDER BY indexed_at DESC"
+        ).fetchall()
+    logger.info("Fetched %d videos from library DB.", len(rows))
+    return [
+        {"video_id": r["video_id"], "url": r["url"], "indexed_at": r["indexed_at"]}
+        for r in rows
+    ]
+
+
+def _find_retrieval_cache_dir(video_id: str) -> Optional[Path]:
+    """Locate the latest retrieval cache directory for a given video ID.
+    
+    Scans PATHS.retrieval for directories matching <video_id>__<hash>__<hash>.
+    Returns the first match or None if the video hasn't been processed yet.
+    """
+    if not PATHS.retrieval.exists():
+        return None
+    for cache_dir in PATHS.retrieval.iterdir():
+        if cache_dir.is_dir() and cache_dir.name.startswith(f"{video_id}__"):
+            return cache_dir
+    return None
+
+
+def load_chunks_for_videos(video_ids: List[str]) -> List[RetrievalChunk]:
+    """Load retrieval chunks for multiple videos from disk cache.
+    
+    Design Rationale:
+    - Uses _find_retrieval_cache_dir to bypass brittle hash lookups.
+    - Attaches video_id dynamically to each chunk for cross-video context rendering.
+    - Gracefully skips videos with missing or corrupted chunk files.
+    """
+    all_chunks: List[RetrievalChunk] = []
+    for vid in video_ids:
+        cache_dir = _find_retrieval_cache_dir(vid)
+        if not cache_dir:
+            logger.warning("No retrieval cache found for video %s. Run Summarize/Q&A first.", vid)
+            continue
+            
+        chunks_path = cache_dir / "chunks.json"
+        if not chunks_path.exists():
+            logger.warning("chunks.json missing in %s", cache_dir)
+            continue
+            
+        data = read_json(chunks_path)
+        if data and isinstance(data.get("chunks"), list):
+            chunks = [RetrievalChunk.from_dict(c) for c in data["chunks"]]
+            for c in chunks:
+                if not c.video_id:  # Backfill legacy chunks missing the field
+                    c.video_id = vid
+            all_chunks.extend(chunks)
+            logger.info("Loaded %d chunks for video %s", len(chunks), vid)
+            
+    logger.info("Total cross-video chunks loaded: %d", len(all_chunks))
+    return all_chunks
+
+
+def load_vector_stores_for_videos(video_ids: List[str], embeddings: OllamaEmbeddings) -> Dict[str, Any]:
+    """Load vector stores for multiple videos, returning {video_id: store}.
+    
+    Design Rationale:
+    - Qdrant loading is decoupled from file-cache directories. Qdrant manages 
+      its own local DB, so missing FAISS/chunks folders should not block it.
+    - FAISS fallback remains gated behind cache_dir existence.
+    - Uses singleton client to prevent portalocker AlreadyLocked crashes.
+    """
+    stores = {}
+
+    # ── 1. Qdrant path (independent of file cache) ─────────────────────
+    if CFG.vector_db_type == "qdrant" and QDRANT_AVAILABLE:
+        from langchain_qdrant import QdrantVectorStore
+        client = get_qdrant_client()
+        collections = {c.name for c in client.get_collections().collections}
+
+        for vid in video_ids:
+            collection_name = f"yt_transcripts_{vid}"
+            if collection_name in collections:
+                stores[vid] = QdrantVectorStore(
+                    client=client,
+                    collection_name=collection_name,
+                    embedding=embeddings,
+                )
+                logger.info("Loaded Qdrant store for video %s", vid)
+
+        logger.info("Successfully loaded %d/%d Qdrant stores.", len(stores), len(video_ids))
+        return stores
+
+    # ── 2. FAISS fallback (requires cache dirs) ────────────────────────
+    for vid in video_ids:
+        cache_dir = _find_retrieval_cache_dir(vid)
+        if not cache_dir:
+            logger.debug("Skipping FAISS load for %s: no cache dir", vid)
+            continue
+
+        faiss_path = cache_dir / "index.faiss"
+        if faiss_path.exists():
+            try:
+                stores[vid] = FAISS.load_local(str(cache_dir), embeddings, allow_dangerous_deserialization=True)
+                logger.info("Loaded FAISS store for video %s", vid)
+            except Exception as e:
+                logger.warning("FAISS load failed for %s: %s", vid, e)
+        else:
+            logger.debug("No index.faiss found in %s", cache_dir)
+
+    logger.info("Successfully loaded %d/%d FAISS stores.", len(stores), len(video_ids))
+    return stores
+
+
+def cross_video_hybrid_search(
+    question: str,
+    video_ids: List[str],
+    embeddings: OllamaEmbeddings,
+    top_k: int = CFG.retrieval_top_k,
+) -> List[HybridDoc]:
+    """Search across multiple video vector stores and fuse results globally."""
+    if not video_ids:
+        logger.warning("Cross-video search called with empty video_ids list.")
+        return []
+
+    logger.info("Starting cross-video hybrid search for %d videos: %s", len(video_ids), video_ids)
+
+    # ── 1. Load vector stores ──────────────────────────────────────────────
+    with log_time("load cross-video vector stores"):
+        stores = load_vector_stores_for_videos(video_ids, embeddings)
+    if not stores:
+        logger.warning("No vector stores found. Ensure videos have been processed via Summarize/Q&A first.")
+        return []
+
+    # ── 2. Collect dense candidates ────────────────────────────────────────
+    with log_time("cross-video dense search"):
+        dense_candidates = []
+        for vid, store in stores.items():
+            try:
+                docs = store.similarity_search_with_score(question, k=CFG.hybrid_top_k_candidates)
+                dense_candidates.extend(docs)
+                logger.debug("Dense search for %s returned %d candidates", vid, len(docs))
+            except Exception as e:
+                logger.warning("Dense search failed for %s: %s", vid, e)
+
+    if not dense_candidates:
+        logger.warning("Dense search returned 0 candidates across all videos.")
+        return []
+
+    # ── 3. Load chunks & build global BM25 ─────────────────────────────────
+    with log_time("load cross-video chunks & build BM25"):
+        all_chunks = load_chunks_for_videos(video_ids)
+    if not all_chunks:
+        logger.warning("No retrieval chunks found on disk for selected videos.")
+        return []
+
+    # Normalize dense scores according to backend semantics
+    dense_scores = [s for _, s in dense_candidates]
+    min_d, max_d = min(dense_scores), max(dense_scores)
+
+    if CFG.vector_db_type == "qdrant":
+        # Cosine similarity: higher is better
+        norm_dense = [
+            (s - min_d) / (max_d - min_d) if max_d > min_d else 1.0
+            for s in dense_scores
+        ]
+    else:
+        # FAISS L2 distance: lower is better
+        norm_dense = [
+            1.0 - ((s - min_d) / (max_d - min_d)) if max_d > min_d else 1.0
+            for s in dense_scores
+        ]
+
+    # BM25 scoring
+    bm25 = build_bm25_index(all_chunks)
+    query_tokens = tokenize_text(question)
+    bm25_scores = bm25.get_scores(query_tokens).tolist()
+    max_bm25 = max(bm25_scores) if bm25_scores else 0.0
+    norm_sparse = [s / max_bm25 if max_bm25 > 0 else 0.0 for s in bm25_scores]
+
+    # ── 4. Global Score Fusion ─────────────────────────────────────────────
+    with log_time("cross-video score fusion"):
+        chunk_lookup = {
+            (getattr(c, "video_id", "unknown"), c.chunk_id): i
+            for i, c in enumerate(all_chunks)
+        }
+        fused_scores: Dict[int, float] = {}
+
+        for (doc, _), nd in zip(dense_candidates, norm_dense):
+            cid = doc.metadata.get("chunk_id")
+            vid = doc.metadata.get("video_id", "unknown")
+            key = (vid, cid)
+            if key in chunk_lookup:
+                idx = chunk_lookup[key]
+                fused_scores[idx] = fused_scores.get(idx, 0.0) + (CFG.hybrid_dense_weight * nd)
+            else:
+                logger.debug("Dense candidate could not be matched to chunk: video=%s chunk_id=%s", vid, cid)
+
+        for idx, ns in enumerate(norm_sparse):
+            fused_scores[idx] = fused_scores.get(idx, 0.0) + ((1.0 - CFG.hybrid_dense_weight) * ns)
+
+        ranked_indices = sorted(
+            fused_scores.keys(),
+            key=lambda i: fused_scores[i],
+            reverse=True,
+        )[:top_k]
+
+    results = [
+        HybridDoc(
+            page_content=all_chunks[idx].text,
+            metadata={
+                "start": all_chunks[idx].start,
+                "end": all_chunks[idx].end,
+                "chunk_id": all_chunks[idx].chunk_id,
+                "video_id": getattr(all_chunks[idx], "video_id", "unknown"),
+                "hybrid_score": fused_scores[idx],
+            },
+        )
+        for idx in ranked_indices
+    ]
+
+    logger.info(
+        "Cross-video hybrid search complete: %d candidates → %d fused results",
+        len(fused_scores),
+        len(results),
+    )
+    return results
+
+
+# =============================================================================
 # Q&A CONTEXT BUILDER
 # =============================================================================
 
@@ -1776,7 +2046,9 @@ def build_context_with_sources(
         text = doc.page_content
 
         time_label = f"{seconds_to_hhmmss(start)} - {seconds_to_hhmmss(end)}"
-        url = build_youtube_time_url(video_id, start)
+        # Prefer per-chunk video_id for cross-video compatibility; fallback to function arg
+        source_vid = meta.get("video_id", video_id)
+        url = build_youtube_time_url(source_vid, start)
 
         source_lookup[label] = SourceRef(
             start=start,
@@ -1786,7 +2058,7 @@ def build_context_with_sources(
             chunk_id=chunk_id,
             text=text,
         )
-        context_parts.append(f"[{label}] {text}")
+        context_parts.append(f"[{label}] (Video: {source_vid}) {text}")
 
     context = "\n\n".join(context_parts)
     return context, source_lookup
@@ -2204,6 +2476,78 @@ def _make_qa_handler(runtime: RuntimeDeps):
     return answer_question_gradio
 
 
+def _make_cross_video_qa_handler(runtime: RuntimeDeps):
+    """Factory for cross-video Q&A with explicit index validation logging."""
+    def cross_video_qa_gradio(selected_videos: List[str], question: str) -> Generator:
+        if not selected_videos:
+            yield "❌ Please select at least one video.", "", 0
+            return
+        if not question.strip():
+            yield "❌ Please provide a question.", "", 0
+            return
+
+        logger.info("Cross-video QA triggered: videos=%s, question='%s...'", selected_videos, question[:50])
+        yield "🔎 Checking retrieval indexes...", "", 5
+
+        missing = []
+        for vid in selected_videos:
+            has_index = False
+            if CFG.vector_db_type == "qdrant" and QDRANT_AVAILABLE:
+                try:
+                    client = get_qdrant_client()
+                    if client.collection_exists(f"yt_transcripts_{vid}"):
+                        has_index = True
+                        logger.info("✅ Qdrant index found for %s", vid)
+                except Exception as e:
+                    logger.warning("Qdrant check failed for %s: %s", vid, e)
+                    
+            if not has_index:
+                cache_dir = _find_retrieval_cache_dir(vid)
+                if cache_dir and (cache_dir / "index.faiss").exists():
+                    has_index = True
+                    logger.info("✅ FAISS index found for %s", vid)
+                    
+            if not has_index:
+                missing.append(vid)
+
+        if missing:
+            logger.warning("Missing retrieval indexes for: %s", missing)
+            yield (
+                f"⚠️ {len(missing)}/{len(selected_videos)} videos lack indexes. Missing: {', '.join(missing)}",
+                "", 0
+            )
+            return
+
+        yield "🔎 Searching across selected videos...", "", 20
+        try:
+            with log_time("cross-video hybrid search pipeline"):
+                docs = cross_video_hybrid_search(
+                    question=question, video_ids=selected_videos, embeddings=runtime.embeddings
+                )
+                
+            if not docs:
+                logger.warning("Cross-video search returned 0 results.")
+                yield "✅ Search complete.", "No relevant evidence found across selected videos.", 100
+                return
+
+            with log_time("cross-video context building"):
+                context, source_lookup = build_context_with_sources(docs, video_id="multi")
+            
+            with log_time("cross-video LLM generation"):
+                tpl = runtime.qa_chain.prompt.template
+                raw = run_llm_dynamic(runtime.llm, tpl, {
+                    "context": context, "question": question, "chat_history": "None"
+                })
+            rendered = render_clickable_answer(raw, source_lookup)
+            logger.info("Cross-video QA successful. Answer length: %d chars", len(rendered))
+            yield "✅ Answer ready.", rendered, 100
+            
+        except Exception as exc:
+            logger.exception("Cross-video QA error")
+            yield f"❌ Error: {exc}", "", 0
+    return cross_video_qa_gradio
+
+
 # =============================================================================
 # EXPORT HELPER FUNCTIONS
 # =============================================================================
@@ -2336,6 +2680,8 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
             Markdown: Live cache size & path stats
             Row:   Refresh stats button  |  Clear cache button
             Label: Operation status feedback
+        
+        Tab 4 - Library & Cross-Video Q&A
 
     A hidden gr.State component carries the SessionState payload between
     handler calls. Both handlers receive it as their last input and emit
@@ -2525,6 +2871,110 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
                 clear_cache_btn.click(
                     fn=lambda: (clear_cache(), get_cache_stats()),
                     outputs=[cache_msg, cache_stats_md],
+                )
+            
+            # ── Tab 4: Library & Cross-Video Q&A ───────────────────────────────
+            with gr.TabItem("📚 Library & Cross-Video Q&A"):
+                with gr.Row():
+                    library_df = gr.Dataframe(
+                        headers=["Video ID", "URL", "Indexed At"],
+                        datatype=["str", "str", "number"],
+                        interactive=False,
+                        label="Indexed Videos"
+                    )
+                    refresh_lib_btn = gr.Button("🔄 Refresh Library")
+
+                video_selector = gr.CheckboxGroup(
+                    label="Select Videos to Search",
+                    choices=[],
+                    interactive=True
+                )
+
+                index_btn = gr.Button("🔨 Index Selected Videos", variant="secondary")
+                index_status = gr.Label(label="Indexing Status")
+
+                def index_selected_videos(selected_videos: List[str]) -> Generator[str, None, None]:
+                    """Batch-index selected videos with full observability."""
+                    if not selected_videos:
+                        yield "❌ No videos selected."
+                        return
+                        
+                    logger.info("Batch indexing triggered for: %s", selected_videos)
+                    logger.info("Vector DB Type: %s | QDRANT_AVAILABLE: %s", CFG.vector_db_type, QDRANT_AVAILABLE)
+                    yield f"🚀 Indexing {len(selected_videos)} videos..."
+                    
+                    try:
+                        for vid in selected_videos:
+                            logger.info("Indexing video: %s", vid)
+                            yield f"📥 Processing {vid}..."
+                            state = SessionState()
+                            video_url = f"https://www.youtube.com/watch?v={vid}"
+                            
+                            # 1. Fetch/Load Transcript
+                            for update in fetch_transcript_from_stt_stream(video_url, runtime):
+                                if update.transcript and update.segments:
+                                    state.set_transcript(video_url, update.transcript, update.segments)
+                                    
+                            if not state.processed_transcript:
+                                logger.warning("Transcript fetch failed for %s", vid)
+                                yield f"⚠️ Failed to fetch transcript for {vid}. Skipping."
+                                continue
+                                
+                            # 2. Build Chunks
+                            logger.info("Building chunks for %s...", vid)
+                            get_or_create_chunks(state, runtime)
+                            if not state.chunks:
+                                logger.error("Chunking returned empty list for %s", vid)
+                                yield f"⚠️ Chunking failed for {vid}. Skipping."
+                                continue
+                                
+                            # 3. Build & Persist Vector Store
+                            logger.info("Building vector store for %s (%d chunks)...", vid, len(state.chunks))
+                            store = get_or_create_vector_store(state, runtime)
+                            if store is None:
+                                logger.error("Vector store creation returned None for %s", vid)
+                                yield f"❌ Vector store build failed for {vid}."
+                                continue
+                                
+                            logger.info("✅ Successfully indexed %s", vid)
+                            yield f"✅ Indexed {vid}."
+                            
+                        yield "🎉 All selected videos indexed successfully."
+                    except Exception as exc:
+                        logger.exception("Batch indexing crashed")
+                        yield f"❌ Indexing failed: {exc}"
+
+                index_btn.click(
+                    fn=index_selected_videos,
+                    inputs=[video_selector],
+                    outputs=[index_status],  # Single output matches single string yields
+                )
+
+                # Explicitly sync backend choices state using gr.update()
+                def refresh_library():
+                    lib = get_video_library()
+                    df_data = [[r["video_id"], r["url"], r["indexed_at"]] for r in lib]
+                    choices = [r["video_id"] for r in lib]
+                    # Returning gr.update(choices=...) tells Gradio to update the 
+                    # validation whitelist, not just the selected values.
+                    return df_data, gr.update(choices=choices)
+
+                refresh_lib_btn.click(
+                    fn=refresh_library,
+                    outputs=[library_df, video_selector]
+                )
+
+                cross_question_input = gr.Textbox(label="Cross-Video Question", lines=2)
+                cross_ask_btn = gr.Button("🔍 Search Across Videos", variant="primary")
+                cross_status = gr.Label(label="Status")
+                cross_progress = gr.Slider(label="Progress", minimum=0, maximum=100, value=0, interactive=False)
+                cross_answer_out = gr.Markdown(label="Cross-Video Answer")
+
+                cross_qa_handler = _make_cross_video_qa_handler(runtime)
+                cross_ask_btn.click(
+                    fn=cross_qa_handler,
+                    inputs=[video_selector, cross_question_input],
+                    outputs=[cross_status, cross_answer_out, cross_progress],
                 )
 
     return interface

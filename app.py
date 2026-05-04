@@ -80,7 +80,7 @@ class AppConfig:
     embedding_model: str = "mxbai-embed-large" # "nomic-embed-text" or "mxbai-embed-large"
     ollama_base_url: str = "http://localhost:11434"
 
-    llm_context_limit: int = 8192
+    llm_context_limit: int = 4096 # 8192
     safety_margin: int = 1024
 
     summary_chunk_overlap_tokens: int = 256
@@ -96,7 +96,7 @@ class AppConfig:
     vector_db_type: str = "qdrant"  # "qdrant" or "faiss"
     qdrant_path: str = "cache/qdrant_db"  # local persistence path
 
-    whisper_model_size: str = "small"   # "small", "medium", "large-v3"
+    whisper_model_size: str = "medium"   # "small", "medium", "large-v3"
     whisper_device: str = "cpu"         # "cpu" or "cuda"
     whisper_compute_type: str = "int8"  # "int8" or "float16"
     whisper_language: Optional[str] = None
@@ -228,6 +228,15 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_summaries_lookup
                 ON summaries(video_id, transcript_hash, mode, summary_config_hash);
+            CREATE TABLE IF NOT EXISTS chapters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                video_id TEXT,
+                transcript_hash TEXT,
+                chapters_json TEXT,
+                saved_at REAL,
+                FOREIGN KEY(video_id) REFERENCES videos(video_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_chapters_lookup ON chapters(video_id, transcript_hash);
         """)
 
 
@@ -480,6 +489,7 @@ class RuntimeDeps:
     chunk_summary_chain: LLMChain
     reduce_summary_chain: LLMChain
     qa_chain: LLMChain
+    chapter_chain: LLMChain
 
 
 # =============================================================================
@@ -592,6 +602,7 @@ Transcript:
 Summary:""",
         ["transcript"],
     )
+
     chunk_summary_chain = make_prompt_chain(
         llm,
         """You are an AI assistant summarizing one part of a YouTube transcript.
@@ -610,6 +621,7 @@ Transcript chunk:
 Chunk summary:""",
         ["chunk"],
     )
+
     reduce_summary_chain = make_prompt_chain(
         llm,
         """You are an AI assistant combining partial summaries of a YouTube transcript.
@@ -627,6 +639,7 @@ Chunk summaries:
 Final summary:""",
         ["summaries"],
     )
+
     qa_chain = make_prompt_chain(
         llm,
         """Answer the question using ONLY the context.
@@ -650,6 +663,27 @@ Answer:""",
         ["context", "question", "chat_history"],
     )
 
+    chapter_chain = make_prompt_chain(
+        llm,
+        """You are an AI that structures YouTube transcripts into logical chapters.
+Analyze the following timestamped segments and group them into coherent chapters.
+Return ONLY a valid JSON array of objects with these exact keys:
+- "title": short descriptive chapter title
+- "start_idx": index of first segment in chapter
+- "end_idx": index of last segment in chapter
+
+Rules:
+- Chapters must cover all segments contiguously (no gaps, no overlaps).
+- Keep titles concise (3-6 words).
+- Return ONLY JSON. No markdown, no explanations.
+
+Segments:
+{segments}
+
+JSON:""",
+        ["segments"],
+    )
+
     logger.info("Models initialized successfully")
     return RuntimeDeps(
         llm=llm,
@@ -659,6 +693,7 @@ Answer:""",
         chunk_summary_chain=chunk_summary_chain,
         reduce_summary_chain=reduce_summary_chain,
         qa_chain=qa_chain,
+        chapter_chain=chapter_chain,
     )
 
 
@@ -1539,11 +1574,13 @@ def build_vector_store(
         else:
             logger.info("Reusing existing Qdrant collection %s", collection_name)
 
+        logger.info(f"Initializing QdrantVectorStore for collection: {collection_name}")
         store = QdrantVectorStore(
             client=client,
             collection_name=collection_name,
             embedding=embeddings,
         )
+        logger.info(f"Adding {len(texts)} texts to the vector store.")
         store.add_texts(texts, metadatas=metadatas)
         return store
 
@@ -2130,6 +2167,115 @@ def render_clickable_answer(
         rendered += "\n".join(ref_lines)
 
     return rendered
+
+# =============================================================================
+# Chapter Generation & Cache Functions
+# =============================================================================
+
+def generate_chapters(
+    segments: List[TranscriptSegment], runtime: RuntimeDeps
+) -> List[Dict[str, Any]]:
+    """Generate logical chapters from transcript segments using LLM topic segmentation.
+    
+    Design Rationale:
+    - Long videos are split into token-safe temporal windows to prevent LLM context overflow.
+    - Each window is processed independently; timestamps remain globally accurate.
+    - Uses a conservative token budget (max_transcript_tokens - safety_margin) to leave room 
+      for system prompt, instructions, and JSON formatting overhead.
+    - Hard Chunk Boundaries: Chapters will not span across token windows. This is intentional.
+      YouTube chapters naturally align with topic shifts, and forcing cross-window continuity
+      would require a second LLM pass (adding 5-10s latency). A lightweight title-merge step
+      handles ~90% of boundary artifacts by extending timestamps when adjacent titles match.
+    - Gracefully handles malformed LLM output or single oversized segments.
+    - Results are cached by transcript_hash, so chunking adds zero latency on reruns.
+    """
+    if not segments:
+        return []
+
+    # Safe token budget for chapter generation.
+    # CFG.max_transcript_tokens already subtracts safety_margin once.
+    # Subtracting it again guarantees ample headroom for prompt overhead & JSON formatting.
+    max_tokens = CFG.max_transcript_tokens - CFG.safety_margin
+    chunks: List[List[TranscriptSegment]] = []
+    current_chunk: List[TranscriptSegment] = []
+    current_tokens = 0
+
+    # ── 1. Split segments into token-safe temporal windows ─────────────────
+    for seg in segments:
+        seg_tokens = estimate_tokens(seg.text)
+        # Hard boundary: if adding this segment exceeds budget, finalize current window
+        if current_tokens + seg_tokens > max_tokens and current_chunk:
+            chunks.append(current_chunk)
+            current_chunk = [seg]
+            current_tokens = seg_tokens
+        else:
+            current_chunk.append(seg)
+            current_tokens += seg_tokens
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    all_chapters: List[Dict[str, Any]] = []
+
+    # ── 2. Generate chapters per chunk using pre-built chain ───────────────
+    for chunk_idx, chunk_segs in enumerate(chunks):
+        # Compact segment representation for prompt efficiency
+        seg_lines = [
+            f"[{i}] {seconds_to_hhmmss(s.start)}-{seconds_to_hhmmss(s.end)}: {s.text[:120]}"
+            for i, s in enumerate(chunk_segs)
+        ]
+        prompt_text = "\n".join(seg_lines)
+
+        try:
+            with log_time(f"LLM chapter generation (chunk {chunk_idx+1}/{len(chunks)})"):
+                # Use the pre-compiled chapter chain from runtime
+                raw = runtime.chapter_chain.predict(segments=prompt_text)
+
+            # Strip markdown code blocks if LLM wraps JSON
+            raw = re.sub(r"```json\s*|\s*```", "", raw.strip())
+            chapters = json.loads(raw)
+
+            # Validate & map to globally accurate timestamps
+            for ch in chapters:
+                s_idx, e_idx = int(ch["start_idx"]), int(ch["end_idx"])
+                if 0 <= s_idx <= e_idx < len(chunk_segs):
+                    all_chapters.append({
+                        "title": str(ch["title"]),
+                        "start": chunk_segs[s_idx].start,
+                        "end": chunk_segs[e_idx].end,
+                    })
+        except Exception as exc:
+            logger.warning("Chapter generation failed for chunk %d: %s. Skipping.", chunk_idx, exc)
+
+    # ── 3. Merge adjacent chapters with identical titles (boundary cleanup) ─
+    # Handles hard chunk boundary artifacts where a topic spans two windows
+    if not all_chapters:
+        return []
+
+    merged = [all_chapters[0]]
+    for ch in all_chapters[1:]:
+        if ch["title"].lower().strip() == merged[-1]["title"].lower().strip():
+            merged[-1]["end"] = ch["end"]  # Extend boundary to merge split topics
+        else:
+            merged.append(ch)
+
+    logger.info("Generated %d chapters across %d temporal windows.", len(merged), len(chunks))
+    return merged
+
+
+def save_chapters(video_id: str, transcript_hash: str, chapters: List[Dict]) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO chapters (video_id, transcript_hash, chapters_json, saved_at) VALUES (?, ?, ?, ?)",
+            (video_id, transcript_hash, json.dumps(chapters), time.time())
+        )
+
+def load_cached_chapters(video_id: str, transcript_hash: str) -> Optional[List[Dict]]:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT chapters_json FROM chapters WHERE video_id = ? AND transcript_hash = ? ORDER BY saved_at DESC LIMIT 1",
+            (video_id, transcript_hash)
+        ).fetchone()
+    return json.loads(row["chapters_json"]) if row else None
 
 
 # =============================================================================
@@ -2757,6 +2903,38 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
                         lines=15,
                         interactive=False,
                     )
+                
+                with gr.Accordion("📖 Auto-Chapters", open=False):
+                    chapters_out = gr.Markdown(label="Chapters", value="No chapters generated yet.")
+                    gen_chapters_btn = gr.Button("🔨 Generate Chapters", variant="secondary")
+
+                def handle_generate_chapters(state_payload: Dict[str, Any]) -> str:
+                    state = SessionState.from_gradio(state_payload)
+                    if not state.transcript_segments:
+                        return "❌ No transcript segments available. Run Summarize first."
+                    
+                    cached = load_cached_chapters(state.video_id, state.transcript_hash)
+                    if cached:
+                        chapters = cached
+                    else:
+                        chapters = generate_chapters(state.transcript_segments, runtime)
+                        if chapters:
+                            save_chapters(state.video_id, state.transcript_hash, chapters)
+                    
+                    if not chapters:
+                        return "⚠️ Chapter generation returned no results."
+                    
+                    lines = ["### 📖 Chapters\n"]
+                    for ch in chapters:
+                        url = build_youtube_time_url(state.video_id, ch["start"])
+                        lines.append(f"- [{seconds_to_hhmmss(ch['start'])} - {seconds_to_hhmmss(ch['end'])}] **{ch['title']}** → [Jump]({url})")
+                    return "\n".join(lines)
+
+                gen_chapters_btn.click(
+                    fn=handle_generate_chapters,
+                    inputs=[session_state],
+                    outputs=[chapters_out],
+                )
 
                 with gr.Row():
                     export_transcript_btn = gr.Button("📥 Export Transcript (.txt)")

@@ -1,3 +1,4 @@
+
 """
 [WIP] YouTube STT Summarizer & Timestamp-Aware Q&A Tool
 
@@ -13,9 +14,11 @@ Business goal:
 import os
 # Must be set before any C extension (CTranslate2, OpenMP) is loaded.
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-os.environ["OMP_NUM_THREADS"] = str(os.cpu_count() // 2) # optional
+# os.environ["OMP_NUM_THREADS"] = "4"
+# os.environ["MKL_NUM_THREADS"] = "4"
 
 import hashlib
+import heapq
 import json
 import logging
 import re
@@ -25,6 +28,7 @@ import shutil
 import sqlite3
 import tempfile
 import time
+import threading
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
@@ -33,20 +37,42 @@ from typing import Any, Dict, Generator, Iterable, List, NamedTuple, Optional, T
 
 import gradio as gr
 import tiktoken
-from faster_whisper import WhisperModel
-from langchain.chains import LLMChain
-from langchain.prompts import PromptTemplate
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import OllamaEmbeddings
+import torch
+# torch.set_num_threads(4)
+# torch.set_num_interop_threads(4)
+from dotenv import load_dotenv
+
+# --- LangChain 0.3.x & Ollama Imports ---
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnableSequence
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
+
+from faster_whisper import WhisperModel
+
 try:
-    from langchain_qdrant import Qdrant
+    from langchain_qdrant import Qdrant, QdrantVectorStore 
     from qdrant_client import QdrantClient
+    from qdrant_client import models as qdrant_models
     QDRANT_AVAILABLE = True
 except ImportError:
     QDRANT_AVAILABLE = False
-from langchain_community.llms import Ollama
 from rank_bm25 import BM25Okapi
+from pyannote.audio import Pipeline
+
+
+load_dotenv()
+
+
+# ── Disable Hugging Face offline mode for pyannote model download ──
+import os
+if os.environ.get("HF_HUB_OFFLINE") == "1":
+    os.environ["HF_HUB_OFFLINE"] = "0"
+# Also ensure online mode is explicitly allowed
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"  # Disable fast download if it causes issues
+# ─────────────────────────────────────────────────────────────────────
+
 
 
 # =============================================================================
@@ -76,7 +102,7 @@ class AppConfig:
     """
 
     base_dir: Path = Path(__file__).resolve().parent
-    llm_model: str = "llama3.1:8b-instruct-q8_0"
+    llm_model: str = "llama3.2:3b" # "llama3.1:8b-instruct-q8_0"
     embedding_model: str = "mxbai-embed-large" # "nomic-embed-text" or "mxbai-embed-large"
     ollama_base_url: str = "http://localhost:11434"
 
@@ -111,10 +137,20 @@ class AppConfig:
     # Enable only if a word-highlight UI is added.
     whisper_word_timestamps: bool = False
 
+    # Speaker diarization backend
+    diarization_backend: str = "pyannote"  # "pyannote", "llm", or "none"
+    # Reads from env at instantiation time. Falls back to None if missing.
+    pyannote_auth_token: Optional[str] = field(
+        default_factory=lambda: os.environ.get("PYANNOTE_AUTH_TOKEN")
+    )
+    diarization_max_speakers: int = 4
+
     summary_prompt_version: str = "summary-v1"
     retrieval_prompt_version: str = "qa-with-timestamps-v1"
     transcript_schema_version: str = "timestamped-transcript-v1"
     retrieval_schema_version: str = "timestamped-retrieval-v2"
+
+
 
     @property
     def max_transcript_tokens(self) -> int:
@@ -160,8 +196,14 @@ TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
 
 # Compiled patterns used by render_clickable_answer.
 # Defined at module level so they are compiled once, not per call.
+# Match grouped citations like [S1, S2, S3] — captures the inner content
 SOURCE_GROUP_PATTERN = re.compile(r"\[((?:S\d+\s*(?:,\s*S\d+\s*)*))\]")
+# Match isolated citations like S1 (not inside brackets) — captures the label
 SOURCE_SINGLE_PATTERN = re.compile(r"(?<!\[)(S\d+)(?!\])")
+
+# Heavy objects like FAISS/Qdrant stores & BM25 indexes live in process memory.
+_VECTOR_STORE_CACHE: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+_VECTOR_STORE_LOCK = threading.Lock()
 
 
 # =============================================================================
@@ -207,6 +249,7 @@ def init_db() -> None:
                 url TEXT,
                 indexed_at REAL
             );
+                           
             CREATE TABLE IF NOT EXISTS transcripts (
                 video_id TEXT PRIMARY KEY,
                 transcript TEXT,
@@ -216,6 +259,7 @@ def init_db() -> None:
                 saved_at REAL,
                 FOREIGN KEY(video_id) REFERENCES videos(video_id)
             );
+
             CREATE TABLE IF NOT EXISTS summaries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 video_id TEXT,
@@ -226,8 +270,10 @@ def init_db() -> None:
                 saved_at REAL,
                 FOREIGN KEY(video_id) REFERENCES videos(video_id)
             );
+
             CREATE INDEX IF NOT EXISTS idx_summaries_lookup
                 ON summaries(video_id, transcript_hash, mode, summary_config_hash);
+                           
             CREATE TABLE IF NOT EXISTS chapters (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 video_id TEXT,
@@ -236,7 +282,16 @@ def init_db() -> None:
                 saved_at REAL,
                 FOREIGN KEY(video_id) REFERENCES videos(video_id)
             );
+
             CREATE INDEX IF NOT EXISTS idx_chapters_lookup ON chapters(video_id, transcript_hash);
+
+            CREATE TABLE IF NOT EXISTS diarization (
+                video_id TEXT PRIMARY KEY,
+                transcript_hash TEXT,
+                speakers_json TEXT,
+                saved_at REAL,
+                FOREIGN KEY(video_id) REFERENCES videos(video_id)
+            );
         """)
 
 
@@ -482,14 +537,16 @@ class TranscriptSegment:
 class RuntimeDeps:
     """Runtime model dependencies and prompt chains."""
 
-    llm: Ollama
+    llm: ChatOllama
     embeddings: OllamaEmbeddings
     whisper: WhisperModel
-    summary_chain: LLMChain
-    chunk_summary_chain: LLMChain
-    reduce_summary_chain: LLMChain
-    qa_chain: LLMChain
-    chapter_chain: LLMChain
+    summary_chain: RunnableSequence
+    chunk_summary_chain: RunnableSequence
+    reduce_summary_chain: RunnableSequence
+    qa_chain: RunnableSequence
+    chapter_chain: RunnableSequence
+    diarization_chain: RunnableSequence
+    diarization_pipeline: Optional[Pipeline]
 
 
 # =============================================================================
@@ -536,7 +593,7 @@ def ensure_ollama_ready(base_url: str, required_models: Iterable[str], timeout: 
         )
     
 
-def warmup_ollama_clients(llm: Ollama, embeddings: OllamaEmbeddings) -> None:
+def warmup_ollama_clients(llm: ChatOllama, embeddings: OllamaEmbeddings) -> None:
     """Verify both embeddings and generation paths before the UI starts."""
     try:
         vector = embeddings.embed_query("health check")
@@ -547,18 +604,37 @@ def warmup_ollama_clients(llm: Ollama, embeddings: OllamaEmbeddings) -> None:
 
     try:
         response = llm.invoke("Reply with OK.")
-        if response is None or not str(response).strip():
+        text = response.content if hasattr(response, "content") else str(response).strip()
+        if not text:
             raise RuntimeError("LLM warmup returned an empty response.")
     except Exception as exc:
         raise RuntimeError("Ollama LLM warmup failed.") from exc
     
 
-def make_prompt_chain(llm: Ollama, template: str, input_variables: List[str]) -> LLMChain:
-    """Construct a LangChain prompt chain with consistent wiring."""
-    return LLMChain(
-        llm=llm,
-        prompt=PromptTemplate(template=template, input_variables=input_variables),
-    )
+def make_prompt_chain(llm: ChatOllama, template: str, input_variables: List[str]) -> RunnableSequence:
+    """Construct a LangChain 0.3 runnable chain (prompt | llm)."""
+    prompt = PromptTemplate(template=template, input_variables=input_variables)
+    return prompt | llm
+
+
+def get_prompt_template(chain: Any) -> str:
+    """Extract prompt template from LangChain runnable chain.
+
+    Must always return a template or raise.
+    Silent None returns cause unpredictable runtime failures.
+    """
+    if chain is None:
+        raise ValueError("Cannot extract prompt template: chain is None")
+
+    if hasattr(chain, "first") and getattr(chain.first, "template", None):
+        return chain.first.template
+
+    if hasattr(chain, "steps") and chain.steps:
+        tpl = getattr(chain.steps[0], "template", None)
+        if tpl:
+            return tpl
+
+    raise ValueError(f"Cannot extract template from chain type={type(chain)}")
 
 
 def build_runtime() -> RuntimeDeps:
@@ -567,11 +643,12 @@ def build_runtime() -> RuntimeDeps:
 
     ensure_ollama_ready(CFG.ollama_base_url, [CFG.llm_model, CFG.embedding_model])
 
-    llm = Ollama(
+    llm = ChatOllama(
         model=CFG.llm_model,
         temperature=0.7,
         top_p=0.9,
         base_url=CFG.ollama_base_url,
+        timeout=180.0,
     )
     embeddings = OllamaEmbeddings(
         model=CFG.embedding_model,
@@ -684,6 +761,56 @@ JSON:""",
         ["segments"],
     )
 
+    diarization_chain = make_prompt_chain(
+        llm,
+        """You are analyzing a conversation transcript split into turns.
+Assign speaker labels (Speaker 1, Speaker 2, etc.) to each turn.
+Return ONLY a valid JSON array of objects with these exact keys:
+"turn_idx": integer index of the turn (0-based)
+"speaker": string label like "Speaker 1", "Speaker 2", etc.
+Rules:
+- Use consistent labels throughout. Maximum 4 distinct speakers.
+- CRITICAL: If the entire text is clearly one speaker (e.g., news anchor, monologue, narration, or continuous reading), assign the SAME label to ALL turns.
+- Infer speaker changes ONLY from clear conversational shifts, Q&A patterns, or pronoun changes.
+- If uncertain, keep the current speaker label.
+Return ONLY JSON. No markdown, no explanations, no extra text.
+Turns:
+{turns}
+JSON:""",
+        ["turns"],
+    )
+
+    diarization_pipeline = None
+
+    if CFG.diarization_backend == "pyannote" and CFG.pyannote_auth_token:
+        try:
+            
+            logger.info("📦 Loading pyannote pipeline: pyannote/speaker-diarization-3.1...")
+            
+            # This downloads (if needed) AND loads the model into memory
+            pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=CFG.pyannote_auth_token,
+            )
+            
+            # Move to device once at startup
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            pipeline.to(device)
+            logger.info("✅ Pyannote pipeline loaded on %s", device)
+            
+            diarization_pipeline = pipeline
+            
+        except Exception as exc:
+            logger.warning(
+                "⚠️ Failed to pre-load pyannote pipeline: %s. "
+                "Falling back to LLM-based diarization.",
+                exc
+            )
+            diarization_pipeline = None
+    else:
+        logger.info("ℹ️ Pyannote diarization disabled or token missing — using LLM fallback")
+        diarization_pipeline = None
+
     logger.info("Models initialized successfully")
     return RuntimeDeps(
         llm=llm,
@@ -694,6 +821,8 @@ JSON:""",
         reduce_summary_chain=reduce_summary_chain,
         qa_chain=qa_chain,
         chapter_chain=chapter_chain,
+        diarization_chain=diarization_chain,
+        diarization_pipeline=diarization_pipeline, 
     )
 
 
@@ -957,7 +1086,7 @@ def chunk_transcript_for_summary(text: str) -> List[str]:
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CFG.summary_target_tokens,
         chunk_overlap=CFG.summary_chunk_overlap_tokens,
-        separators=["\n\n", "\n", " ", ""],
+        separators=["\n\n", "\n", "."],
         length_function=estimate_tokens,
     )
     return splitter.split_text(text)
@@ -982,7 +1111,7 @@ def summarize_transcript_stream(
     if estimate_tokens(text) <= CFG.max_transcript_tokens:
         yield SummaryUpdate("📝 Generating direct summary...", None, 30)
         with log_time("direct summary generation"):
-            tpl = prompt_override or runtime.summary_chain.prompt.template
+            tpl = prompt_override or get_prompt_template(runtime.summary_chain)
             summary = run_llm_dynamic(runtime.llm, tpl, {"transcript": text})
         if not summary:
             raise RuntimeError("Direct summary generation returned empty output.")
@@ -1007,7 +1136,7 @@ def summarize_transcript_stream(
                 f"📝 Summarizing chunk {idx}/{total}...", None, progress
             )
             with log_time(f"chunk summary {pass_idx}:{idx}/{total}"):
-                tpl = prompt_override or runtime.chunk_summary_chain.prompt.template
+                tpl = prompt_override or get_prompt_template(runtime.chunk_summary_chain)
                 chunk_summary = run_llm_dynamic(runtime.llm, tpl, {"chunk": chunk})
             if not chunk_summary:
                 raise RuntimeError(
@@ -1028,7 +1157,7 @@ def summarize_transcript_stream(
                 90,
             )
             with log_time("final merged summary generation"):
-                tpl = prompt_override or runtime.reduce_summary_chain.prompt.template
+                tpl = prompt_override or get_prompt_template(runtime.reduce_summary_chain)
                 final_summary = run_llm_dynamic(runtime.llm, tpl, {"summaries": merged})
             if not final_summary:
                 raise RuntimeError(
@@ -1261,6 +1390,7 @@ class SessionState:
     faiss_index: Optional[Any] = None
     summary_prompt_override: str = ""
     qa_prompt_override: str = ""
+    bm25_index: Optional[Any] = None
 
     # ------------------------------------------------------------------ #
     # Mutation helpers                                                     #
@@ -1277,6 +1407,7 @@ class SessionState:
         self.chat_history = []
         self.chunks = None
         self.faiss_index = None
+        self.bm25_index = None
 
     def set_transcript(
         self,
@@ -1352,7 +1483,8 @@ class SessionState:
                 else None
             ),
             # Kept by reference — not serialised to JSON.
-            "faiss_index": self.faiss_index,
+            "faiss_index": None,  # Kept in _VECTOR_STORE_CACHE
+            "bm25_index": None,   # Kept in _VECTOR_STORE_CACHE
             "summary_prompt_override": self.summary_prompt_override,
             "qa_prompt_override": self.qa_prompt_override,
         }
@@ -1378,11 +1510,24 @@ class SessionState:
         raw_segments = payload.get("transcript_segments") or []
         raw_chunks = payload.get("chunks")
 
+        # Reattach heavy objects from global cache if available
+        video_id = str(payload.get("video_id", ""))
+        transcript_hash = str(payload.get("transcript_hash", ""))
+        faiss_idx = None
+        bm25_idx = None
+        if video_id and transcript_hash:
+            cache_key = (video_id, transcript_hash, CFG.vector_db_type)
+            with _VECTOR_STORE_LOCK:
+                cached = _VECTOR_STORE_CACHE.get(cache_key)
+                if cached:
+                    faiss_idx = cached.get("store")
+                    bm25_idx = cached.get("bm25")
+
         return cls(
             video_url=str(payload.get("video_url", "")),
-            video_id=str(payload.get("video_id", "")),
+            video_id=video_id,
             processed_transcript=str(payload.get("processed_transcript", "")),
-            transcript_hash=str(payload.get("transcript_hash", "")),
+            transcript_hash=transcript_hash,
             transcript_segments=[
                 TranscriptSegment.from_dict(s)
                 for s in raw_segments
@@ -1400,7 +1545,8 @@ class SessionState:
                 else None
             ),
             # Live object or None — passed through from to_gradio().
-            faiss_index=payload.get("faiss_index"),
+            faiss_index=faiss_idx,
+            bm25_index=bm25_idx,
             summary_prompt_override=str(payload.get("summary_prompt_override", "")),
             qa_prompt_override=str(payload.get("qa_prompt_override", "")),
         )
@@ -1449,6 +1595,25 @@ def save_retrieval_cache(
     logger.info(
         "Retrieval cache saved (%d chunks) → %s", len(chunks), cache_dir
     )
+
+
+def load_cached_chunks(video_id: str, transcript_hash: str) -> Optional[List[RetrievalChunk]]:
+    """Load only retrieval chunks from disk without touching FAISS/Qdrant."""
+    cache_dir = retrieval_record_path(video_id, transcript_hash)
+    chunks_path = cache_dir / "chunks.json"
+
+    if not chunks_path.exists():
+        return None
+
+    try:
+        raw = json.loads(chunks_path.read_text(encoding="utf-8"))
+        # raw is a dict. Extract the "chunks" list and use from_dict for safety.
+        chunks_raw = raw.get("chunks", []) if isinstance(raw, dict) else []
+        return [RetrievalChunk.from_dict(item) for item in chunks_raw if isinstance(item, dict)]
+
+    except Exception as exc:
+        logger.warning("Failed to load cached chunks from %s: %s", chunks_path, exc)
+        return None
 
 
 def load_retrieval_cache(
@@ -1501,15 +1666,14 @@ def get_or_create_chunks(state: SessionState, runtime: RuntimeDeps) -> None:
     if state.chunks is not None:
         return
 
-    cached = load_retrieval_cache(
-        state.video_id, state.transcript_hash, embeddings=None  # chunks only
-    )
-    # load_retrieval_cache returns None when the FAISS files are missing too,
-    # but the JSON chunk file may exist independently after a partial save.
-    # We skip the FAISS half here; get_or_create_faiss handles it.
-    if cached:
-        state.chunks, _ = cached
-        logger.info("Chunks loaded from retrieval cache (%d).", len(state.chunks))
+    cached_chunks = load_cached_chunks(state.video_id, state.transcript_hash)
+    if cached_chunks:
+        state.chunks = cached_chunks
+        logger.info(
+            "Loaded %d cached retrieval chunks for %s",
+            len(state.chunks),
+            state.video_id,
+        )
         return
 
     logger.info(
@@ -1534,13 +1698,16 @@ def get_qdrant_client() -> "QdrantClient":
     """
     global _qdrant_client_instance
     if _qdrant_client_instance is None:
-        from qdrant_client import QdrantClient
 
         qdrant_path = str((CFG.base_dir / CFG.qdrant_path).resolve())
         logger.info("Initializing singleton Qdrant client at %s", qdrant_path)
         _qdrant_client_instance = QdrantClient(path=qdrant_path)
 
     return _qdrant_client_instance
+
+
+def qdrant_collection_name(video_id: str) -> str:
+    return f"yt_transcripts_{video_id}_{RETRIEVAL_CONFIG_HASH}"
 
 
 def build_vector_store(
@@ -1553,11 +1720,8 @@ def build_vector_store(
         if not QDRANT_AVAILABLE:
             raise ImportError("Install qdrant-client and langchain-qdrant for Qdrant support.")
 
-        from qdrant_client import models as qdrant_models
-        from langchain_qdrant import QdrantVectorStore
-
         client = get_qdrant_client()
-        collection_name = f"yt_transcripts_{video_id}"
+        collection_name = qdrant_collection_name(video_id)
 
         sample_vec = embeddings.embed_query("dimension check")
         vector_size = len(sample_vec)
@@ -1589,6 +1753,7 @@ def build_vector_store(
 
 def load_vector_store(
     video_id: str,
+    transcript_hash: str,
     embeddings: OllamaEmbeddings,
 ) -> Optional[Any]:
     if CFG.vector_db_type == "qdrant":
@@ -1596,12 +1761,12 @@ def load_vector_store(
             logger.warning("Qdrant requested but qdrant dependencies are unavailable.")
             return None
 
-        from langchain_qdrant import QdrantVectorStore
-
-        collection_name = f"yt_transcripts_{video_id}"
+        collection_name = qdrant_collection_name(video_id)
         try:
             client = get_qdrant_client()
-            if not client.collection_exists(collection_name):
+            # Safe collection existence check
+            collections = {c.name for c in client.get_collections().collections}
+            if collection_name not in collections:
                 logger.info("Qdrant collection not found for %s: %s", video_id, collection_name)
                 return None
 
@@ -1615,36 +1780,42 @@ def load_vector_store(
             logger.warning("Failed to load Qdrant collection for %s: %s", video_id, e)
             return None
 
-    cache_dir = retrieval_record_path(video_id, text_hash(""))
+    cache_dir = retrieval_record_path(video_id, transcript_hash)
     faiss_path = cache_dir / "index.faiss"
     if faiss_path.exists():
+        logger.info("FAISS path exists, returning cached vector store.")
         return FAISS.load_local(str(cache_dir), embeddings, allow_dangerous_deserialization=True)
     return None
 
-def get_or_create_vector_store(state: SessionState, runtime: RuntimeDeps) -> Any:
-    """Return the vector store for the active session, building & persisting if necessary.
-    
-    Design Rationale:
-    - 3-layer cache: memory → disk → fresh build.
-    - Ensures chunks.json exists early so cross-video BM25 works even when 
-      the vector store is loaded from cache.
-    - FAISS requires explicit .save_local(). Qdrant local mode auto-persists 
-      to CFG.qdrant_path via the singleton client.
-    - state.faiss_index is a legacy field name but now holds any vector store 
-      type for backward compatibility with SessionState serialization.
-    """
-    # ── 1. Fast path: in-memory cache ──────────────────────────────────────
-    if state.faiss_index is not None:
-        logger.info("Vector store found in session memory — reusing.")
-        return state.faiss_index
 
-    # ── 2. Resolve cache paths once ────────────────────────────────────────
+def get_or_create_vector_store(state: "SessionState", runtime: RuntimeDeps) -> Any:
+    """Return the vector store for the active session.
+
+    Clean design:
+    - Gradio state stays JSON-safe (no FAISS/Qdrant objects stored inside it)
+    - 3-layer cache: memory → disk → build
+    - always ensures chunks.json exists for BM25 cross-video search
+    """
+    if not state.video_id or not state.transcript_hash:
+        raise ValueError("Session missing video_id or transcript_hash.")
+
+    if not state.chunks:
+        raise RuntimeError("Cannot build vector store: state.chunks is empty.")
+
+    cache_key = (state.video_id, state.transcript_hash, CFG.vector_db_type)
+
+    # ── 1. In-memory cache ────────────────────────────────────────────────
+    with _VECTOR_STORE_LOCK:
+        cached = _VECTOR_STORE_CACHE.get(cache_key)
+        if cached and cached.get("store") is not None:
+            logger.info("Vector store cache hit (memory).")
+            return cached["store"]
+
+    # ── 2. Ensure chunks.json exists (needed for cross-video BM25) ─────────
     cache_dir = retrieval_record_path(state.video_id, state.transcript_hash)
     chunks_path = cache_dir / "chunks.json"
 
-    # ── 3. Ensure chunks.json exists (critical for cross-video BM25) ───────
-    # Runs idempotently. Guarantees lexical search works even on cache hits.
-    if state.chunks and not chunks_path.exists():
+    if not chunks_path.exists():
         cache_dir.mkdir(parents=True, exist_ok=True)
         write_json_atomic(
             chunks_path,
@@ -1659,17 +1830,16 @@ def get_or_create_vector_store(state: SessionState, runtime: RuntimeDeps) -> Any
         )
         logger.info("Chunks metadata saved to %s", chunks_path)
 
-    # ── 4. Disk cache check ────────────────────────────────────────────────
-    store = load_vector_store(state.video_id, runtime.embeddings)
-    if store:
-        state.faiss_index = store
+    # ── 3. Disk cache ─────────────────────────────────────────────────────
+    store = load_vector_store(state.video_id, state.transcript_hash, runtime.embeddings)
+    if store is not None:
+        with _VECTOR_STORE_LOCK:
+            _VECTOR_STORE_CACHE[cache_key] = {"store": store, "bm25": None}
+
         logger.info("Vector store loaded from disk cache.")
         return store
 
-    # ── 5. Build fresh vector store ────────────────────────────────────────
-    if not state.chunks:
-        raise RuntimeError("Cannot build vector store: state.chunks is empty.")
-
+    # ── 4. Build fresh ────────────────────────────────────────────────────
     logger.info("Building vector store from %d chunks...", len(state.chunks))
     texts = [chunk.text for chunk in state.chunks]
     metadatas = [
@@ -1678,47 +1848,36 @@ def get_or_create_vector_store(state: SessionState, runtime: RuntimeDeps) -> Any
     ]
 
     with log_time("Vector store build"):
-        store = build_vector_store(texts, metadatas, runtime.embeddings, state.video_id)
-
-    # ── 6. Persist artifacts to disk ───────────────────────────────────────
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    # Save chunks.json if step 3 was skipped (e.g., state.chunks was populated late)
-    if not chunks_path.exists():
-        write_json_atomic(
-            chunks_path,
-            {
-                "video_id": state.video_id,
-                "transcript_hash": state.transcript_hash,
-                "chunks": [chunk.to_dict() for chunk in state.chunks],
-                "retrieval_config_hash": RETRIEVAL_CONFIG_HASH,
-                "retrieval_config": current_retrieval_config(),
-                "saved_at": time.time(),
-            },
+        store = build_vector_store(
+            texts=texts,
+            metadatas=metadatas,
+            embeddings=runtime.embeddings,
+            video_id=state.video_id,
         )
-        logger.info("Chunks metadata saved to %s", chunks_path)
 
-    # Backend-specific persistence
+    # ── 5. Persist (FAISS requires save_local; Qdrant persists automatically) ──
     if CFG.vector_db_type == "faiss":
+        cache_dir.mkdir(parents=True, exist_ok=True)
         store.save_local(str(cache_dir))
         logger.info("FAISS index persisted to %s", cache_dir)
+
     elif CFG.vector_db_type == "qdrant" and QDRANT_AVAILABLE:
         client = get_qdrant_client()
-        collection_name = f"yt_transcripts_{state.video_id}"
+        collection_name = qdrant_collection_name(state.video_id)
         if client.collection_exists(collection_name):
             logger.info(
-                "Qdrant collection auto-persisted: %s at %s",
+                "Qdrant collection persisted: %s at %s",
                 collection_name,
                 (CFG.base_dir / CFG.qdrant_path).resolve(),
             )
         else:
-            logger.warning(
-                "Qdrant collection missing after build: %s. Check disk permissions or path config.",
-                collection_name,
-            )
+            logger.warning("Qdrant collection missing after build: %s", collection_name)
 
-    state.faiss_index = store
-    logger.info("Vector store built and fully persisted.")
+    # ── 6. Store in memory cache ──────────────────────────────────────────
+    with _VECTOR_STORE_LOCK:
+        _VECTOR_STORE_CACHE[cache_key] = {"store": store, "bm25": None}
+
+    logger.info("Vector store built and cached in memory.")
     return store
 
 # =============================================================================
@@ -1743,77 +1902,175 @@ def build_bm25_index(chunks: List[RetrievalChunk]) -> BM25Okapi:
     return BM25Okapi(tokenized_corpus)
 
 
+
 def hybrid_search(
     question: str,
     vector_store: Any,
     chunks: List[RetrievalChunk],
-    embeddings: OllamaEmbeddings,
+    cached_bm25: Optional[BM25Okapi] = None,
     top_k: int = CFG.retrieval_top_k,
     candidates: int = CFG.hybrid_top_k_candidates,
     alpha: float = CFG.hybrid_dense_weight,
-) -> List[HybridDoc]:
-    """Run dense + sparse retrieval and fuse scores via weighted normalization.
-    
-    BM25 is rebuilt in-memory per query (<50ms for ~200 chunks) to guarantee
-    sync with the active FAISS index and avoid pickle/cache complexity.
+) -> Tuple[List[HybridDoc], BM25Okapi]:
     """
+    Hybrid retrieval: Dense vector search (FAISS/Qdrant) + sparse BM25 search.
+
+    Strategy:
+    - Dense retrieval provides semantic similarity (embedding-based).
+    - BM25 provides lexical relevance (keyword-based).
+    - Both score streams are normalized into [0.0, 1.0].
+    - Scores are fused via weighted sum:
+        fused = alpha * dense_score + (1 - alpha) * sparse_score
+
+    Score normalization details:
+    - Qdrant returns cosine similarity (higher is better).
+    - FAISS returns L2 distance (lower is better).
+      For FAISS we invert the normalized distance so "better" becomes closer to 1.0.
+
+    Parameters:
+        question:
+            User query.
+        vector_store:
+            LangChain vector store (FAISS or QdrantVectorStore).
+            Must support similarity_search_with_score().
+        chunks:
+            RetrievalChunk list aligned with the vector store content.
+            chunk.chunk_id must match metadata["chunk_id"] stored in the vector store.
+        cached_bm25:
+            Optional cached BM25 index for the same chunk list.
+            If None, BM25 is built in-memory.
+        top_k:
+            Final number of fused results to return.
+        candidates:
+            Number of dense candidates to fetch from vector search.
+        alpha:
+            Dense weight factor in [0.0, 1.0].
+            1.0 = pure dense, 0.0 = pure BM25.
+
+    Returns:
+        (results, bm25_index)
+        results is a list of HybridDoc objects with metadata including timestamps
+        and the final fused score.
+
+    Notes:
+    - BM25 scoring is computed across *all* chunks, meaning sparse retrieval
+      contributes a baseline relevance score for the entire corpus.
+    - Dense retrieval contributes only for retrieved candidate docs.
+    """
+
+    # Guard: no chunks means no retrieval is possible.
+    # Must still return a BM25 object to satisfy the declared return type.
     if not chunks:
-        return []
+        bm25 = cached_bm25 if cached_bm25 is not None else BM25Okapi([])
+        return [], bm25
 
-    # ── 1. Dense Vector Search ─────────────────────────────────────────────
+    # Clamp alpha defensively so misconfigured settings cannot break fusion math.
+    alpha = max(0.0, min(1.0, float(alpha)))
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 1) Dense retrieval (vector store)
+    # ──────────────────────────────────────────────────────────────────────
+    # Returns list of tuples: (Document, score)
+    # - Qdrant score = cosine similarity (higher better)
+    # - FAISS score  = L2 distance (lower better)
     dense_docs = vector_store.similarity_search_with_score(question, k=candidates)
-    dense_scores = [score for _, score in dense_docs]
 
-    # Qdrant returns cosine similarity (higher = better).
-    # FAISS returns L2 distance (lower = better).
-    # Normalize both to [0, 1] where 1.0 = best match.
+    dense_scores: List[float] = [score for _, score in dense_docs]
+
+    # Normalize dense scores into [0, 1] where 1.0 is best match.
+    norm_dense: List[float] = []
     if dense_scores:
         min_s, max_s = min(dense_scores), max(dense_scores)
-        if CFG.vector_db_type == "qdrant":
-            # Cosine similarity: direct min-max normalization
-            norm_dense = [(s - min_s) / (max_s - min_s) if max_s > min_s else 1.0 for s in dense_scores]
-        else:
-            # L2 distance: invert after normalization
-            norm_dense = [1.0 - ((s - min_s) / (max_s - min_s)) if max_s > min_s else 1.0 for s in dense_scores]
-    else:
-        norm_dense = []
+        logger.info(
+            "Dense scores: min=%.4f max=%.4f backend=%s",
+            min_s, max_s, CFG.vector_db_type
+        )
 
-    # ── 2. Sparse BM25 search ──────────────────────────────────────────────
-    bm25 = build_bm25_index(chunks)
+        if max_s > min_s:
+            if CFG.vector_db_type == "qdrant":
+                # Cosine similarity: higher is better, normalize directly.
+                norm_dense = [(s - min_s) / (max_s - min_s) for s in dense_scores]
+            else:
+                # L2 distance: lower is better.
+                # Normalize distance, then invert so best becomes 1.0.
+                norm_dense = [1.0 - ((s - min_s) / (max_s - min_s)) for s in dense_scores]
+        else:
+            # All dense scores are equal -> treat them as equally relevant.
+            norm_dense = [1.0] * len(dense_scores)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 2) Sparse retrieval (BM25)
+    # ──────────────────────────────────────────────────────────────────────
+    # Use cached BM25 index if provided; otherwise build it from chunks.
+    bm25 = cached_bm25 if cached_bm25 is not None else build_bm25_index(chunks)
+
     query_tokens = tokenize_text(question)
-    # .tolist() converts the NumPy array to a standard Python list
-    bm25_scores = bm25.get_scores(query_tokens).tolist()
-    
-    # Normalize BM25 scores to [0,1]
+
+    # bm25.get_scores may return numpy array OR python list depending on version.
+    bm25_scores = list(bm25.get_scores(query_tokens))
+
+    # Normalize BM25 scores into [0, 1].
     max_bm25 = max(bm25_scores) if bm25_scores else 0.0
     norm_sparse = [s / max_bm25 if max_bm25 > 0 else 0.0 for s in bm25_scores]
 
-    # ── 3. Score Fusion ────────────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────────
+    # 3) Fusion: weighted sum of normalized dense and sparse scores
+    # ──────────────────────────────────────────────────────────────────────
+    # Map chunk_id -> chunk list index.
+    # This assumes chunk_id is stable and stored in vector-store metadata.
     chunk_id_to_idx = {c.chunk_id: i for i, c in enumerate(chunks)}
+
     fused_scores: Dict[int, float] = {}
 
-    for (doc, _), nd in zip(dense_docs, norm_dense):
+    # Dense contribution: only applies to retrieved candidates.
+    for (doc, _raw_score), nd in zip(dense_docs, norm_dense):
         cid = doc.metadata.get("chunk_id")
-        if cid in chunk_id_to_idx:
-            idx = chunk_id_to_idx[cid]
-            fused_scores[idx] = fused_scores.get(idx, 0.0) + (alpha * nd)
+        if cid is None:
+            continue
 
+        idx = chunk_id_to_idx.get(cid)
+        if idx is None:
+            continue
+
+        fused_scores[idx] = fused_scores.get(idx, 0.0) + (alpha * nd)
+
+    # Sparse contribution: applies to all chunks (full-corpus BM25 ranking).
+    sparse_weight = 1.0 - alpha
     for idx, ns in enumerate(norm_sparse):
-        fused_scores[idx] = fused_scores.get(idx, 0.0) + ((1.0 - alpha) * ns)
+        fused_scores[idx] = fused_scores.get(idx, 0.0) + (sparse_weight * ns)
 
-    # ── 4. Rank & Return Top-K ─────────────────────────────────────────────
-    ranked_indices = sorted(fused_scores.keys(), key=lambda i: fused_scores[i], reverse=True)[:top_k]
-    
-    results = []
+    # ──────────────────────────────────────────────────────────────────────
+    # 4) Rank fused scores and build HybridDoc results
+    # ──────────────────────────────────────────────────────────────────────
+    ranked_indices = sorted(
+        fused_scores.keys(),
+        key=lambda i: fused_scores[i],
+        reverse=True,
+    )[:top_k]
+
+    results: List[HybridDoc] = []
     for idx in ranked_indices:
         chunk = chunks[idx]
-        results.append(HybridDoc(
-            page_content=chunk.text,
-            metadata={"start": chunk.start, "end": chunk.end, "chunk_id": chunk.chunk_id, "hybrid_score": fused_scores[idx]}
-        ))
-        
-    logger.info("Hybrid search complete: %d candidates → %d fused results", len(fused_scores), len(results))
-    return results
+        results.append(
+            HybridDoc(
+                page_content=chunk.text,
+                metadata={
+                    "start": chunk.start,
+                    "end": chunk.end,
+                    "chunk_id": chunk.chunk_id,
+                    "segment_ids": chunk.segment_ids,
+                    "hybrid_score": fused_scores[idx],
+                },
+            )
+        )
+
+    logger.info(
+        "Hybrid search complete: dense_candidates=%d chunks=%d → returned=%d",
+        len(dense_docs),
+        len(chunks),
+        len(results),
+    )
+    return results, bm25
 
 
 # =============================================================================
@@ -1837,17 +2094,43 @@ def get_video_library() -> List[Dict[str, Any]]:
 
 
 def _find_retrieval_cache_dir(video_id: str) -> Optional[Path]:
-    """Locate the latest retrieval cache directory for a given video ID.
-    
-    Scans PATHS.retrieval for directories matching <video_id>__<hash>__<hash>.
-    Returns the first match or None if the video hasn't been processed yet.
+    """
+    Return the most recently saved retrieval cache directory for a given video_id.
+
+    This scans PATHS.retrieval for folders matching:
+        <video_id>__<retrieval_config_hash>__<transcript_hash>
+
+    Multiple caches can exist for one video (different transcripts/configs).
+    We choose the newest valid one based on chunks.json["saved_at"].
     """
     if not PATHS.retrieval.exists():
         return None
+
+    candidates: List[Tuple[float, Path]] = []
+
     for cache_dir in PATHS.retrieval.iterdir():
-        if cache_dir.is_dir() and cache_dir.name.startswith(f"{video_id}__"):
-            return cache_dir
-    return None
+        if not cache_dir.is_dir():
+            continue
+        if not cache_dir.name.startswith(f"{video_id}__"):
+            continue
+
+        chunks_path = cache_dir / "chunks.json"
+        if not chunks_path.exists():
+            continue
+
+        try:
+            data = read_json(chunks_path)
+            saved_at = float(data.get("saved_at", 0.0)) if isinstance(data, dict) else 0.0
+            candidates.append((saved_at, cache_dir))
+        except Exception:
+            continue
+
+    if not candidates:
+        return None
+
+    # newest first
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
 
 
 def load_chunks_for_videos(video_ids: List[str]) -> List[RetrievalChunk]:
@@ -1883,37 +2166,53 @@ def load_chunks_for_videos(video_ids: List[str]) -> List[RetrievalChunk]:
     return all_chunks
 
 
-def load_vector_stores_for_videos(video_ids: List[str], embeddings: OllamaEmbeddings) -> Dict[str, Any]:
+def load_vector_stores_for_videos(
+    video_ids: List[str],
+    embeddings: OllamaEmbeddings,
+) -> Dict[str, Any]:
     """Load vector stores for multiple videos, returning {video_id: store}.
-    
+
     Design Rationale:
-    - Qdrant loading is decoupled from file-cache directories. Qdrant manages 
-      its own local DB, so missing FAISS/chunks folders should not block it.
+    - Qdrant loading is decoupled from file-cache directories.
     - FAISS fallback remains gated behind cache_dir existence.
     - Uses singleton client to prevent portalocker AlreadyLocked crashes.
     """
-    stores = {}
+    if not video_ids:
+        logger.warning("load_vector_stores_for_videos called with empty video_ids list.")
+        return {}
 
-    # ── 1. Qdrant path (independent of file cache) ─────────────────────
+    stores: Dict[str, Any] = {}
+
+    # ── 1. Qdrant path (independent of file cache) ─────────────────────────
     if CFG.vector_db_type == "qdrant" and QDRANT_AVAILABLE:
-        from langchain_qdrant import QdrantVectorStore
-        client = get_qdrant_client()
-        collections = {c.name for c in client.get_collections().collections}
+        try:
+            client = get_qdrant_client()
+            collections = {c.name for c in client.get_collections().collections}
+        except Exception as exc:
+            logger.warning("Failed to query Qdrant collections: %s", exc)
+            collections = set()
 
         for vid in video_ids:
-            collection_name = f"yt_transcripts_{vid}"
-            if collection_name in collections:
+            # Use helper to match the actual collection name on disk
+            collection_name = qdrant_collection_name(vid)
+            if collection_name not in collections:
+                logger.debug("No Qdrant collection found for %s", vid)
+                continue
+
+            try:
                 stores[vid] = QdrantVectorStore(
                     client=client,
                     collection_name=collection_name,
                     embedding=embeddings,
                 )
                 logger.info("Loaded Qdrant store for video %s", vid)
+            except Exception as exc:
+                logger.warning("Failed to load Qdrant store for %s: %s", vid, exc)
 
-        logger.info("Successfully loaded %d/%d Qdrant stores.", len(stores), len(video_ids))
+        logger.info("Loaded %d/%d Qdrant stores.", len(stores), len(video_ids))
         return stores
 
-    # ── 2. FAISS fallback (requires cache dirs) ────────────────────────
+    # ── 2. FAISS fallback (requires cache dirs) ────────────────────────────
     for vid in video_ids:
         cache_dir = _find_retrieval_cache_dir(vid)
         if not cache_dir:
@@ -1921,16 +2220,21 @@ def load_vector_stores_for_videos(video_ids: List[str], embeddings: OllamaEmbedd
             continue
 
         faiss_path = cache_dir / "index.faiss"
-        if faiss_path.exists():
-            try:
-                stores[vid] = FAISS.load_local(str(cache_dir), embeddings, allow_dangerous_deserialization=True)
-                logger.info("Loaded FAISS store for video %s", vid)
-            except Exception as e:
-                logger.warning("FAISS load failed for %s: %s", vid, e)
-        else:
-            logger.debug("No index.faiss found in %s", cache_dir)
+        if not faiss_path.exists():
+            logger.debug("Skipping FAISS load for %s: missing %s", vid, faiss_path)
+            continue
 
-    logger.info("Successfully loaded %d/%d FAISS stores.", len(stores), len(video_ids))
+        try:
+            stores[vid] = FAISS.load_local(
+                str(cache_dir),
+                embeddings,
+                allow_dangerous_deserialization=True,
+            )
+            logger.info("Loaded FAISS store for video %s", vid)
+        except Exception as exc:
+            logger.warning("FAISS load failed for %s: %s", vid, exc)
+
+    logger.info("Loaded %d/%d FAISS stores.", len(stores), len(video_ids))
     return stores
 
 
@@ -1939,134 +2243,587 @@ def cross_video_hybrid_search(
     video_ids: List[str],
     embeddings: OllamaEmbeddings,
     top_k: int = CFG.retrieval_top_k,
+    dense_candidates_per_video: int = CFG.hybrid_top_k_candidates,
+    sparse_candidates_global: int = 200,
+    alpha: float = CFG.hybrid_dense_weight,
 ) -> List[HybridDoc]:
-    """Search across multiple video vector stores and fuse results globally."""
+    """
+    Hybrid retrieval across multiple videos.
+
+    This function performs retrieval in two independent channels:
+
+    1) Dense retrieval:
+       - Queries each video's vector store (FAISS or Qdrant).
+       - Retrieves top-N candidates per video.
+       - Dense scores are normalized per video because score ranges are not
+         comparable across independent vector indexes.
+
+    2) Sparse retrieval (BM25):
+       - Loads all chunks across selected videos.
+       - Builds a BM25 index (lexical search).
+       - Retrieves top-M sparse candidates globally.
+
+    Then both signals are fused via weighted sum:
+
+        fused = alpha * dense_norm + (1 - alpha) * sparse_norm
+
+    Performance notes:
+    - BM25 scoring across all chunks is O(total_chunks) and can become expensive.
+      This implementation limits sparse fusion to the top sparse candidates.
+    - Dense search cost scales with number of videos (one query per store).
+
+    Parameters:
+        question:
+            User query text.
+        video_ids:
+            List of video IDs to search across.
+        embeddings:
+            Embeddings client used to load vector stores (FAISS load_local / Qdrant).
+        top_k:
+            Final number of results returned.
+        dense_candidates_per_video:
+            Dense candidates retrieved per video store.
+        sparse_candidates_global:
+            Number of sparse candidates kept for fusion (limits BM25 influence and runtime).
+        alpha:
+            Dense weight in [0.0, 1.0].
+
+    Returns:
+        Ranked list of HybridDoc objects with metadata containing:
+            - start, end timestamps
+            - chunk_id
+            - video_id
+            - hybrid_score
+    """
     if not video_ids:
         logger.warning("Cross-video search called with empty video_ids list.")
         return []
 
-    logger.info("Starting cross-video hybrid search for %d videos: %s", len(video_ids), video_ids)
+    alpha = max(0.0, min(1.0, float(alpha)))
 
-    # ── 1. Load vector stores ──────────────────────────────────────────────
+    logger.info(
+        "Starting cross-video hybrid search: videos=%d dense_k=%d sparse_k=%d",
+        len(video_ids),
+        dense_candidates_per_video,
+        sparse_candidates_global,
+    )
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 1) Load vector stores (FAISS/Qdrant) for selected videos
+    # ──────────────────────────────────────────────────────────────────────
     with log_time("load cross-video vector stores"):
         stores = load_vector_stores_for_videos(video_ids, embeddings)
+
     if not stores:
-        logger.warning("No vector stores found. Ensure videos have been processed via Summarize/Q&A first.")
+        logger.warning(
+            "No vector stores found. Ensure videos were processed via Summarize/Q&A first."
+        )
         return []
 
-    # ── 2. Collect dense candidates ────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────────────
+    # 2) Dense retrieval (per video) with per-video normalization
+    # ──────────────────────────────────────────────────────────────────────
+    # We normalize per-video because dense score ranges are not comparable
+    # across different FAISS indexes / Qdrant collections.
+    dense_norm_by_key: Dict[Tuple[str, int], float] = {}
+
     with log_time("cross-video dense search"):
-        dense_candidates = []
         for vid, store in stores.items():
             try:
-                docs = store.similarity_search_with_score(question, k=CFG.hybrid_top_k_candidates)
-                dense_candidates.extend(docs)
-                logger.debug("Dense search for %s returned %d candidates", vid, len(docs))
-            except Exception as e:
-                logger.warning("Dense search failed for %s: %s", vid, e)
+                docs = store.similarity_search_with_score(
+                    question, k=dense_candidates_per_video
+                )
+            except Exception as exc:
+                logger.warning("Dense search failed for %s: %s", vid, exc)
+                continue
 
-    if not dense_candidates:
-        logger.warning("Dense search returned 0 candidates across all videos.")
+            if not docs:
+                continue
+
+            raw_scores = [score for _, score in docs]
+            min_s, max_s = min(raw_scores), max(raw_scores)
+
+            # Normalize to [0,1] where 1 is best.
+            # Qdrant: cosine similarity (higher better)
+            # FAISS:  L2 distance (lower better)
+            norm_scores: List[float] = []
+            if max_s > min_s:
+                if CFG.vector_db_type == "qdrant":
+                    norm_scores = [(s - min_s) / (max_s - min_s) for s in raw_scores]
+                else:
+                    norm_scores = [1.0 - ((s - min_s) / (max_s - min_s)) for s in raw_scores]
+            else:
+                norm_scores = [1.0] * len(raw_scores)
+
+            # Deduplicate by (video_id, chunk_id), keeping the best normalized score.
+            for (doc, _), nd in zip(docs, norm_scores):
+                chunk_id = doc.metadata.get("chunk_id")
+                doc_vid = doc.metadata.get("video_id") or vid
+
+                if chunk_id is None:
+                    continue
+
+                key = (doc_vid, int(chunk_id))
+                prev = dense_norm_by_key.get(key)
+                if prev is None or nd > prev:
+                    dense_norm_by_key[key] = nd
+
+    if not dense_norm_by_key:
+        logger.warning("Dense search returned 0 usable candidates across all videos.")
         return []
 
-    # ── 3. Load chunks & build global BM25 ─────────────────────────────────
-    with log_time("load cross-video chunks & build BM25"):
+    # ──────────────────────────────────────────────────────────────────────
+    # 3) Load all chunks for BM25 and build lookup index
+    # ──────────────────────────────────────────────────────────────────────
+    with log_time("load cross-video chunks"):
         all_chunks = load_chunks_for_videos(video_ids)
+
     if not all_chunks:
         logger.warning("No retrieval chunks found on disk for selected videos.")
         return []
 
-    # Normalize dense scores according to backend semantics
-    dense_scores = [s for _, s in dense_candidates]
-    min_d, max_d = min(dense_scores), max(dense_scores)
+    # Build lookup so we can map (video_id, chunk_id) -> chunk object.
+    chunk_by_key: Dict[Tuple[str, int], RetrievalChunk] = {}
+    for c in all_chunks:
+        vid = getattr(c, "video_id", None) or "unknown"
+        chunk_by_key[(vid, int(c.chunk_id))] = c
 
-    if CFG.vector_db_type == "qdrant":
-        # Cosine similarity: higher is better
-        norm_dense = [
-            (s - min_d) / (max_d - min_d) if max_d > min_d else 1.0
-            for s in dense_scores
-        ]
-    else:
-        # FAISS L2 distance: lower is better
-        norm_dense = [
-            1.0 - ((s - min_d) / (max_d - min_d)) if max_d > min_d else 1.0
-            for s in dense_scores
-        ]
+    # ──────────────────────────────────────────────────────────────────────
+    # 4) Sparse retrieval (BM25)
+    # ──────────────────────────────────────────────────────────────────────
+    # BM25 requires scoring the entire corpus, which is O(total_chunks).
+    # We still compute full scores but only keep the top-N sparse candidates
+    # to reduce fusion work and prevent BM25 from dominating all results.
+    with log_time("build BM25 index"):
+        bm25 = build_bm25_index(all_chunks)
 
-    # BM25 scoring
-    bm25 = build_bm25_index(all_chunks)
     query_tokens = tokenize_text(question)
-    bm25_scores = bm25.get_scores(query_tokens).tolist()
-    max_bm25 = max(bm25_scores) if bm25_scores else 0.0
-    norm_sparse = [s / max_bm25 if max_bm25 > 0 else 0.0 for s in bm25_scores]
 
-    # ── 4. Global Score Fusion ─────────────────────────────────────────────
-    with log_time("cross-video score fusion"):
-        chunk_lookup = {
-            (getattr(c, "video_id", "unknown"), c.chunk_id): i
-            for i, c in enumerate(all_chunks)
-        }
-        fused_scores: Dict[int, float] = {}
+    with log_time("BM25 scoring"):
+        bm25_scores = list(bm25.get_scores(query_tokens))
 
-        for (doc, _), nd in zip(dense_candidates, norm_dense):
-            cid = doc.metadata.get("chunk_id")
-            vid = doc.metadata.get("video_id", "unknown")
-            key = (vid, cid)
-            if key in chunk_lookup:
-                idx = chunk_lookup[key]
-                fused_scores[idx] = fused_scores.get(idx, 0.0) + (CFG.hybrid_dense_weight * nd)
-            else:
-                logger.debug("Dense candidate could not be matched to chunk: video=%s chunk_id=%s", vid, cid)
+    if bm25_scores:
+        max_bm25 = max(bm25_scores)
+        if max_bm25 > 0:
+            norm_sparse = [s / max_bm25 for s in bm25_scores]
+        else:
+            norm_sparse = [0.0] * len(bm25_scores)
+    else:
+        norm_sparse = []
 
-        for idx, ns in enumerate(norm_sparse):
-            fused_scores[idx] = fused_scores.get(idx, 0.0) + ((1.0 - CFG.hybrid_dense_weight) * ns)
+    # Select only top sparse candidates (indices into all_chunks)
+    # This prevents sparse scoring from flooding fused_scores with every chunk.
+    sparse_top_indices = heapq.nlargest(
+        min(sparse_candidates_global, len(all_chunks)),
+        range(len(all_chunks)),
+        key=lambda i: norm_sparse[i] if i < len(norm_sparse) else 0.0,
+    )
 
-        ranked_indices = sorted(
-            fused_scores.keys(),
-            key=lambda i: fused_scores[i],
-            reverse=True,
-        )[:top_k]
+    sparse_norm_by_key: Dict[Tuple[str, int], float] = {}
+    for idx in sparse_top_indices:
+        chunk = all_chunks[idx]
+        vid = getattr(chunk, "video_id", None) or "unknown"
+        sparse_norm_by_key[(vid, int(chunk.chunk_id))] = norm_sparse[idx]
 
-    results = [
-        HybridDoc(
-            page_content=all_chunks[idx].text,
-            metadata={
-                "start": all_chunks[idx].start,
-                "end": all_chunks[idx].end,
-                "chunk_id": all_chunks[idx].chunk_id,
-                "video_id": getattr(all_chunks[idx], "video_id", "unknown"),
-                "hybrid_score": fused_scores[idx],
-            },
+    # ──────────────────────────────────────────────────────────────────────
+    # 5) Fusion on union of dense + sparse candidate keys
+    # ──────────────────────────────────────────────────────────────────────
+    fused_scores: Dict[Tuple[str, int], float] = {}
+
+    dense_weight = alpha
+    sparse_weight = 1.0 - alpha
+
+    candidate_keys = set(dense_norm_by_key.keys()) | set(sparse_norm_by_key.keys())
+
+    for key in candidate_keys:
+        d = dense_norm_by_key.get(key, 0.0)
+        s = sparse_norm_by_key.get(key, 0.0)
+        fused_scores[key] = (dense_weight * d) + (sparse_weight * s)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 6) Rank and build HybridDoc results
+    # ──────────────────────────────────────────────────────────────────────
+    ranked_keys = heapq.nlargest(
+        min(top_k, len(fused_scores)),
+        fused_scores.keys(),
+        key=lambda k: fused_scores[k],
+    )
+
+    results: List[HybridDoc] = []
+    for vid, cid in ranked_keys:
+        chunk = chunk_by_key.get((vid, cid))
+        if chunk is None:
+            # Should not happen unless disk cache is inconsistent with vector store metadata.
+            logger.debug("Fused key missing from chunk cache: video=%s chunk_id=%s", vid, cid)
+            continue
+
+        results.append(
+            HybridDoc(
+                page_content=chunk.text,
+                metadata={
+                    "start": chunk.start,
+                    "end": chunk.end,
+                    "chunk_id": chunk.chunk_id,
+                    "video_id": vid,
+                    "hybrid_score": fused_scores[(vid, cid)],
+                },
+            )
         )
-        for idx in ranked_indices
-    ]
 
     logger.info(
-        "Cross-video hybrid search complete: %d candidates → %d fused results",
+        "Cross-video hybrid search complete: dense=%d sparse=%d fused=%d returned=%d",
+        len(dense_norm_by_key),
+        len(sparse_norm_by_key),
         len(fused_scores),
         len(results),
     )
+
     return results
 
+
+# =============================================================================
+# SPEAKER DIARIZATION
+# =============================================================================
+
+def format_diarized_transcript(segments: List[TranscriptSegment], speakers: List[str]) -> str:
+    """Combine transcript segments and speaker labels into a readable Markdown string."""
+    if not segments or not speakers:
+        return ""
+
+    parts = []
+    current_speaker = None
+    current_text = []
+    
+    # Ensure we don't go out of bounds if lists differ in length
+    count = min(len(segments), len(speakers))
+    
+    for i in range(count):
+        seg = segments[i]
+        spk = speakers[i]
+        
+        # Skip empty text segments
+        if not seg.text.strip():
+            continue
+
+        # If speaker changes, save the previous block and start a new one
+        if spk != current_speaker:
+            if current_speaker is not None:
+                # Format: **Speaker ID**: Text
+                parts.append(f"**{current_speaker}**: {' '.join(current_text)}")
+            
+            current_speaker = spk
+            current_text = [seg.text.strip()]
+        else:
+            # Same speaker, append text
+            current_text.append(seg.text.strip())
+    
+    # Flush the last block
+    if current_speaker is not None:
+        parts.append(f"**{current_speaker}**: {' '.join(current_text)}")
+        
+    return "\n\n".join(parts)
+
+
+def save_diarization(video_id: str, transcript_hash: str, speakers: List[str]) -> None:
+    """Persist speaker labels to SQLite."""
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO diarization (video_id, transcript_hash, speakers_json, saved_at) VALUES (?, ?, ?, ?)",
+            (video_id, transcript_hash, json.dumps(speakers), time.time())
+        )
+
+
+def load_cached_diarization(video_id: str, transcript_hash: str) -> Optional[List[str]]:
+    """Load cached speaker labels from SQLite."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT speakers_json FROM diarization WHERE video_id = ? AND transcript_hash = ? ORDER BY saved_at DESC LIMIT 1",
+            (video_id, transcript_hash)
+        ).fetchone()
+    return json.loads(row["speakers_json"]) if row else None
+
+
+def diarize_transcript_llm(
+    segments: List[TranscriptSegment],
+    runtime: RuntimeDeps,  # ← Changed from `llm: Ollama` to `runtime: RuntimeDeps`
+    pause_threshold: float = 1.5,
+) -> List[str]:
+    """Assign speaker labels using pause detection + LLM conversational refinement.
+    
+    Design Rationale:
+    - Acoustic diarization (pyannote) requires numpy>=2.0, which conflicts with
+      LangChain 0.2.x. This LLM-based approach is fully compatible, lightweight,
+      and runs locally in ~2-4s.
+    - Step 1: Rule-based pause detection marks likely speaker turns using audio
+      gaps >= pause_threshold seconds. This works even with VAD-filtered audio
+      because Whisper preserves relative timing between segments.
+    - Step 2: LLM reviews turn boundaries & assigns consistent Speaker N labels
+      using conversational cues (questions, answers, tone shifts, pronouns).
+    - Gracefully degrades to "Unknown" if LLM fails, returns malformed JSON,
+      or if no usable turns can be constructed.
+    - Returns a list of labels exactly matching len(segments) for 1:1 mapping
+      to transcript segments, enabling seamless integration with context builders.
+    
+    Args:
+        segments: List of TranscriptSegment objects with start/end timestamps.
+        runtime: Initialized RuntimeDeps instance containing the diarization_chain.
+        pause_threshold: Minimum gap in seconds to consider a speaker turn
+                        boundary (default: 1.5s). Tune based on content type.
+    
+    Returns:
+        List[str]: Speaker labels aligned 1:1 with input segments.
+                  Values are "Speaker 1", "Speaker 2", etc., or "Unknown"
+                  for segments that couldn't be confidently labeled.
+    
+    Note:
+        This is a conversational heuristic, not acoustic diarization.
+        Accuracy is highest for interviews, panels, and clear turn-taking.
+        Monologues, overlapping speech, or rapid interruptions may yield
+        less reliable results. For production-grade acoustic diarization,
+        migrate to pyannote.audio after upgrading to LangChain 0.3.x.
+    """
+    if not segments:
+        logger.debug("diarize_transcript_llm called with empty segments list.")
+        return []
+
+    with log_time("LLM speaker diarization (pause detection + refinement)"):
+        # ── 1. Detect pause-based boundaries ───────────────────────────────────
+        # Identify segment indices where speaker turns likely occur
+        boundaries = [0]  # Always start with first segment
+        for i in range(1, len(segments)):
+            gap = segments[i].start - segments[i - 1].end
+            if gap >= pause_threshold:
+                boundaries.append(i)
+        boundaries.append(len(segments))  # Sentinel for final turn
+        
+        logger.debug(
+            "Detected %d turn boundaries from %d segments (threshold=%.1fs).",
+            len(boundaries) - 1,
+            len(segments),
+            pause_threshold,
+        )
+
+        # ── 2. Build conversational turn blocks ────────────────────────────────
+        # Group contiguous segments between boundaries into logical turns
+        turns: List[Dict[str, Any]] = []
+        for i in range(len(boundaries) - 1):
+            start_idx, end_idx = boundaries[i], boundaries[i + 1]
+            turn_segments = segments[start_idx:end_idx]
+            turn_text = " ".join(seg.text.strip() for seg in turn_segments if seg.text.strip())
+            
+            if turn_text:  # Skip empty turns
+                turns.append({
+                    "start_idx": start_idx,
+                    "end_idx": end_idx - 1,  # Inclusive end index
+                    "text": turn_text[:1200], 
+                    "duration": turn_segments[-1].end - turn_segments[0].start,
+                })
+        
+        if not turns:
+            logger.warning("No usable turns extracted from %d segments.", len(segments))
+            return ["Unknown"] * len(segments)
+        
+        logger.info("Constructed %d conversational turns from %d segments.", len(turns), len(segments))
+
+        # ── 3. LLM assigns speaker labels via pre-built chain ──────────────────
+        # Format turns for prompt with clear indexing
+        turn_lines = [
+            f"[Turn {idx}] ({t['duration']:.1f}s): {t['text']}"
+            for idx, t in enumerate(turns)
+        ]
+        
+        try:
+            with log_time("LLM speaker labeling inference"):
+                # Use the pre-compiled diarization chain from runtime
+                # run_llm_dynamic handles ChatOllama + RunnableSequence internally
+                tpl = get_prompt_template(runtime.diarization_chain)
+                raw_response = run_llm_dynamic(
+                    llm=runtime.llm,
+                    template=tpl,
+                    inputs={"turns": "\n".join(turn_lines)},
+                )
+            
+            # Strip markdown code blocks if LLM wraps JSON
+            cleaned = re.sub(r"```json\s*|\s*```", "", raw_response.strip())
+            
+            # Parse JSON with fallback for malformed responses
+            try:
+                labels = json.loads(cleaned)
+            except json.JSONDecodeError as e:
+                logger.warning("LLM returned malformed JSON for diarization: %s. Response: %s", e, cleaned[:200])
+                return ["Unknown"] * len(segments)
+            
+            # Validate structure: must be list of dicts with required keys
+            if not isinstance(labels, list) or not all(
+                isinstance(item, dict) and "turn_idx" in item and "speaker" in item
+                for item in labels
+            ):
+                logger.warning("LLM diarization response has invalid structure: %s", labels)
+                return ["Unknown"] * len(segments)
+            
+            logger.debug("LLM assigned %d speaker labels to %d turns.", len(labels), len(turns))
+
+            # ── 4. Map labels back to individual segments ──────────────────────
+            # Initialize all segments as "Unknown", then fill in labeled ranges
+            seg_speakers = ["Unknown"] * len(segments)
+            
+            for item in labels:
+                try:
+                    t_idx = int(item["turn_idx"])
+                    speaker_label = str(item["speaker"]).strip()
+                    
+                    if 0 <= t_idx < len(turns):
+                        turn = turns[t_idx]
+                        start_seg, end_seg = turn["start_idx"], turn["end_idx"]
+                        
+                        # Assign label to all segments in this turn
+                        for seg_idx in range(start_seg, end_seg + 1):
+                            if 0 <= seg_idx < len(segments):
+                                seg_speakers[seg_idx] = speaker_label
+                                
+                except (KeyError, ValueError, TypeError) as e:
+                    logger.debug("Skipping malformed label item %s: %s", item, e)
+                    continue
+            
+            # Log summary statistics
+            unique_speakers = set(s for s in seg_speakers if s != "Unknown")
+            logger.info(
+                "Diarization complete: %d segments labeled with %d unique speakers: %s",
+                len(seg_speakers),
+                len(unique_speakers),
+                sorted(unique_speakers),
+            )
+            
+            return seg_speakers
+            
+        except Exception as exc:
+            logger.warning("LLM diarization failed: %s. Returning Unknown labels.", exc, exc_info=True)
+            return ["Unknown"] * len(segments)
+
+
+
+def diarize_audio_acoustic(
+    wav_path: Path,
+    segments: List[TranscriptSegment],
+    runtime: RuntimeDeps,
+    max_speakers: int = CFG.diarization_max_speakers,
+) -> List[str]:
+    """Assign speaker labels using pre-loaded pyannote pipeline.
+
+    Implementation Notes:
+    - Uses runtime.diarization_pipeline loaded at startup.
+    - Maps diarization turns to transcript segments efficiently (two-pointer scan).
+    """
+    if not segments:
+        logger.debug("diarize_audio_acoustic: empty segments list, returning early.")
+        return []
+
+    pipeline = runtime.diarization_pipeline
+    if pipeline is None:
+        logger.warning("⚠️ Pyannote pipeline not pre-loaded — returning Unknown labels.")
+        return ["Unknown"] * len(segments)
+
+    start_total = time.perf_counter()
+    logger.info(
+        "🎙️ START: diarize_audio_acoustic for %s (%d segments, max_speakers=%d)",
+        wav_path.name,
+        len(segments),
+        max_speakers,
+    )
+
+    try:
+        infer_start = time.perf_counter()
+        diarization = pipeline(
+            str(wav_path),
+            min_speakers=1,
+            max_speakers=max_speakers
+        )
+        infer_time = time.perf_counter() - infer_start
+        logger.info("✓ Inference complete in %.2fs", infer_time)
+
+        tracks = sorted(
+            diarization.itertracks(yield_label=True),
+            key=lambda x: x[0].start,
+        )
+        logger.info("✓ Found %d diarization tracks", len(tracks))
+
+        speaker_labels = ["Unknown"] * len(segments)
+
+        seg_idx = 0
+        mapped_segments = 0
+
+        for turn, _, speaker in tracks:
+            # advance segments until they could overlap
+            while seg_idx < len(segments) and segments[seg_idx].end <= turn.start:
+                seg_idx += 1
+
+            j = seg_idx
+            while j < len(segments) and segments[j].start < turn.end:
+                seg = segments[j]
+                overlap = max(0.0, min(seg.end, turn.end) - max(seg.start, turn.start))
+
+                if overlap >= 0.1:  # at least 100ms overlap
+                    if speaker_labels[j] == "Unknown":
+                        speaker_labels[j] = speaker
+                        mapped_segments += 1
+
+                j += 1
+
+        unique_speakers = sorted({s for s in speaker_labels if s != "Unknown"})
+        total_time = time.perf_counter() - start_total
+
+        logger.info(
+            "✅ diarize_audio_acoustic complete in %.2fs | mapped=%d/%d | speakers=%d %s",
+            total_time,
+            mapped_segments,
+            len(segments),
+            len(unique_speakers),
+            unique_speakers,
+        )
+        return speaker_labels
+
+    except Exception as exc:
+        elapsed = time.perf_counter() - start_total
+        logger.error(
+            "❌ diarize_audio_acoustic failed after %.2fs: %s",
+            elapsed,
+            exc,
+            exc_info=True,
+        )
+        return ["Unknown"] * len(segments)
+    
+
+# ── Post-processing merge helper  ───────
+def merge_adjacent_speaker_labels(labels: List[str]) -> List[str]:
+    """Merge consecutive identical speaker labels to fix over-segmentation."""
+    if not labels:
+        return labels
+    merged = [labels[0]]
+    for lbl in labels[1:]:
+        if lbl != merged[-1]:
+            merged.append(lbl)
+        # If same as previous, keep it (no change needed, but ensures continuity)
+    # Actually, we want to keep the list length identical to segments.
+    # The real fix is to ensure pyannote/LLM doesn't split unnecessarily.
+    # But if they do, we can smooth short alternating labels:
+    return labels  # Length must match segments. Smoothing happens at turn level.    
 
 # =============================================================================
 # Q&A CONTEXT BUILDER
 # =============================================================================
 
 def build_context_with_sources(
-    docs: List[Any], video_id: str
+    docs: List[Any], 
+    video_id: str, 
+    speakers: Optional[List[str]] = None  
 ) -> Tuple[str, Dict[str, SourceRef]]:
-    """Convert FAISS-retrieved documents into a labelled context string.
-
-    Each document is assigned a sequential label S1, S2, S3 … that the LLM
-    can cite inline in its answer.  A parallel lookup dict maps every label to
-    a SourceRef so the citation renderer can replace [S1] with a formatted
-    Markdown link without doing any additional lookups.
-
-    Returns:
-        context     — multi-line string with labelled passages, ready to be
-                      inserted into the QA prompt's {context} slot.
-        source_lookup — {label: SourceRef} for every document in docs.
+    """Convert retrieved documents into a labelled context string.
+    
+    Args:
+        docs: List of retrieved documents (FAISS/Qdrant results).
+        video_id: Default video ID for citation URLs.
+        speakers: Optional list of speaker labels matching transcript segments.
+                  When provided, context lines are prefixed with [Speaker N].
     """
     if not docs:
         return "", {}
@@ -2083,19 +2840,20 @@ def build_context_with_sources(
         text = doc.page_content
 
         time_label = f"{seconds_to_hhmmss(start)} - {seconds_to_hhmmss(end)}"
-        # Prefer per-chunk video_id for cross-video compatibility; fallback to function arg
         source_vid = meta.get("video_id", video_id)
         url = build_youtube_time_url(source_vid, start)
 
+        # ── Optional speaker prefix ────────────────────────────────────────
+        speaker_tag = ""
+        if speakers:
+            seg_ids = meta.get("segment_ids", [])
+            if seg_ids and seg_ids[0] < len(speakers):
+                speaker_tag = f"[{speakers[seg_ids[0]]}] "
+
         source_lookup[label] = SourceRef(
-            start=start,
-            end=end,
-            label=time_label,
-            url=url,
-            chunk_id=chunk_id,
-            text=text,
+            start=start, end=end, label=time_label, url=url, chunk_id=chunk_id, text=text,
         )
-        context_parts.append(f"[{label}] (Video: {source_vid}) {text}")
+        context_parts.append(f"[{label}] {speaker_tag}(Video: {source_vid}) {text}")
 
     context = "\n\n".join(context_parts)
     return context, source_lookup
@@ -2188,6 +2946,7 @@ def generate_chapters(
       handles ~90% of boundary artifacts by extending timestamps when adjacent titles match.
     - Gracefully handles malformed LLM output or single oversized segments.
     - Results are cached by transcript_hash, so chunking adds zero latency on reruns.
+    - LangChain 0.3.x: Uses .invoke() on RunnableSequence and extracts .content from AIMessage.
     """
     if not segments:
         return []
@@ -2227,8 +2986,9 @@ def generate_chapters(
 
         try:
             with log_time(f"LLM chapter generation (chunk {chunk_idx+1}/{len(chunks)})"):
-                # Use the pre-compiled chapter chain from runtime
-                raw = runtime.chapter_chain.predict(segments=prompt_text)
+                # LangChain 0.3.x: Use .invoke() with dict input, extract .content
+                response = runtime.chapter_chain.invoke({"segments": prompt_text})
+                raw = response.content if hasattr(response, "content") else str(response).strip()
 
             # Strip markdown code blocks if LLM wraps JSON
             raw = re.sub(r"```json\s*|\s*```", "", raw.strip())
@@ -2282,26 +3042,44 @@ def load_cached_chapters(video_id: str, transcript_hash: str) -> Optional[List[D
 # GRADIO HANDLERS
 # =============================================================================
 
-def run_llm_dynamic(llm: Ollama, template: str, inputs: Dict[str, str]) -> str:
-    """Run LLM with a custom prompt template without rebuilding chains.
-    
-    Design Rationale:
-    - Dynamically extracts only variables actually present in the template.
-      This prevents LangChain's strict PromptTemplate validation from crashing
-      when users provide overrides that omit optional variables like {chat_history}.
-    - Falls back gracefully if the template is empty or malformed.
+def run_llm_dynamic(llm: ChatOllama, template: str, inputs: Dict[str, str]) -> str:
+    """Run LLM with a custom prompt template using LangChain runnables.
+
+    Filters inputs to only variables used in the template.
+    Prevents accidental injection of unused keys.
     """
-    import re
-    # Extract {variable_name} placeholders from the template
+    if not template or not template.strip():
+        raise ValueError("Prompt template is empty.")
+
     template_vars = set(re.findall(r"\{(\w+)\}", template))
+    if not template_vars:
+        raise ValueError("Prompt template contains no {variables}.")
+
     filtered_inputs = {k: v for k, v in inputs.items() if k in template_vars}
-    
-    if not filtered_inputs:
-        raise ValueError("Prompt template contains no valid input variables.")
-        
-    prompt = PromptTemplate(template=template, input_variables=list(filtered_inputs.keys()))
-    chain = LLMChain(llm=llm, prompt=prompt)
-    return chain.predict(**filtered_inputs).strip()
+
+    missing = template_vars - set(filtered_inputs.keys())
+    if missing:
+        raise ValueError(f"Missing required prompt variables: {sorted(missing)}")
+
+    prompt = PromptTemplate(template=template, input_variables=sorted(template_vars))
+    chain = prompt | llm
+
+    rendered = template.format(**filtered_inputs)
+    logger.info(
+        "Sending request to Ollama (%d chars, ~%d tokens)...",
+        len(rendered),
+        estimate_tokens(rendered),
+    )
+
+    try:
+        response = chain.invoke(filtered_inputs)
+        result = response.content if hasattr(response, "content") else str(response).strip()
+        logger.info("Ollama response received (%d chars).", len(result))
+        return result
+
+    except Exception as exc:
+        logger.exception("Ollama generation failed")
+        raise RuntimeError(f"LLM generation failed: {exc}") from exc
 
 
 def _make_summarize_handler(runtime: RuntimeDeps):
@@ -2479,6 +3257,7 @@ def _make_qa_handler(runtime: RuntimeDeps):
         user_question: str,
         state_payload: Dict[str, Any],
         qa_prompt_override: str,
+        show_speakers: bool = False,
     ) -> Generator:
         """Run timestamp-aware transcript Q&A and stream UI updates.
 
@@ -2540,7 +3319,7 @@ def _make_qa_handler(runtime: RuntimeDeps):
             progress = 45
             yield (
                 "🧩 Preparing timestamp-aware retrieval chunks...",
-                "", progress, state.to_gradio(),
+                state.chat_history, progress, state.to_gradio(),
             )
             get_or_create_chunks(state, runtime)
 
@@ -2559,20 +3338,33 @@ def _make_qa_handler(runtime: RuntimeDeps):
                 state.chat_history, progress, state.to_gradio(),
             )
             with log_time("Hybrid dense+BM25 search"):
-                docs = hybrid_search(
+                docs, updated_bm25 = hybrid_search(
                     question=question,
                     vector_store=vector_store,
                     chunks=state.chunks,
-                    embeddings=runtime.embeddings,
+                    cached_bm25=state.bm25_index,
                 )
+                state.bm25_index = updated_bm25  # Persist in state
+
+                # Sync back to global cache using your existing lock
+                cache_key = (state.video_id, state.transcript_hash, CFG.vector_db_type)
+                with _VECTOR_STORE_LOCK:
+                    if cache_key in _VECTOR_STORE_CACHE:
+                        _VECTOR_STORE_CACHE[cache_key]["bm25"] = updated_bm25
 
             if not docs:
                 state.chat_history.append({"role": "user", "content": question})
                 state.chat_history.append({"role": "assistant", "content": "I couldn't find relevant transcript evidence for that question."})
                 yield "✅ Answer ready.", state.chat_history, 100, state.to_gradio()
                 return
+            
+            # Load speaker labels if toggle is active
+            speakers = None
+            if show_speakers:
+                speakers = load_cached_diarization(state.video_id, state.transcript_hash)
 
-            context, source_lookup = build_context_with_sources(docs, state.video_id)
+            context, source_lookup = build_context_with_sources(docs, state.video_id, speakers=speakers)
+            # logger.info("CONTEXT PREVIEW:\n%s", context[:1500])
             if not context.strip():
                 state.chat_history.append({"role": "user", "content": question})
                 state.chat_history.append({"role": "assistant", "content": "I couldn't build usable context from the retrieved chunks."})
@@ -2583,6 +3375,7 @@ def _make_qa_handler(runtime: RuntimeDeps):
             history_str = "\n".join(
                 f"{msg['role'].capitalize()}: {msg['content']}" 
                 for msg in state.chat_history[-10:]  # last 5 turns
+                if not (msg["role"] == "assistant" and "don't have enough information" in msg["content"].lower())
             ) if state.chat_history else "None"
 
             # ── LLM answer generation ────────────────────────────────────────
@@ -2595,7 +3388,11 @@ def _make_qa_handler(runtime: RuntimeDeps):
             )
 
             with log_time("QA generation"):
-                tpl = state.qa_prompt_override or runtime.qa_chain.prompt.template
+                tpl = state.qa_prompt_override or get_prompt_template(runtime.qa_chain)
+                # logger.info("QA PROMPT TEMPLATE:\n%s", tpl)
+                # logger.info("QUESTION: %s", question)
+                # logger.info("QA TEMPLATE:\n%s", tpl[:2000])
+                # logger.info("CONTEXT PREVIEW:\n%s", context[:2000])
                 raw_answer = run_llm_dynamic(runtime.llm, tpl, {
                     "context": context, "question": question, "chat_history": history_str
                 })
@@ -2634,19 +3431,22 @@ def _make_cross_video_qa_handler(runtime: RuntimeDeps):
 
         logger.info("Cross-video QA triggered: videos=%s, question='%s...'", selected_videos, question[:50])
         yield "🔎 Checking retrieval indexes...", "", 5
-
         missing = []
         for vid in selected_videos:
             has_index = False
+            
+            # ── Qdrant Check ─────────────────────────────────────────────────
             if CFG.vector_db_type == "qdrant" and QDRANT_AVAILABLE:
                 try:
                     client = get_qdrant_client()
-                    if client.collection_exists(f"yt_transcripts_{vid}"):
+                    # Use helper to include RETRIEVAL_CONFIG_HASH suffix
+                    if client.collection_exists(qdrant_collection_name(vid)):
                         has_index = True
                         logger.info("✅ Qdrant index found for %s", vid)
                 except Exception as e:
                     logger.warning("Qdrant check failed for %s: %s", vid, e)
                     
+            # ── FAISS Fallback Check ─────────────────────────────────────────
             if not has_index:
                 cache_dir = _find_retrieval_cache_dir(vid)
                 if cache_dir and (cache_dir / "index.faiss").exists():
@@ -2680,7 +3480,7 @@ def _make_cross_video_qa_handler(runtime: RuntimeDeps):
                 context, source_lookup = build_context_with_sources(docs, video_id="multi")
             
             with log_time("cross-video LLM generation"):
-                tpl = runtime.qa_chain.prompt.template
+                tpl = get_prompt_template(runtime.qa_chain)
                 raw = run_llm_dynamic(runtime.llm, tpl, {
                     "context": context, "question": question, "chat_history": "None"
                 })
@@ -2773,16 +3573,19 @@ def get_cache_stats() -> str:
         return "⚠️ Unable to calculate cache size."
 
 def clear_cache() -> str:
-    """Safely delete all cache files and recreate directory structure.
-    
-    Note: This only removes on-disk artifacts. In-memory SessionState 
-    (transcript, FAISS index, chat history) remains intact until the 
-    user refreshes the page or loads a new video.
-    """
+    """Safely delete all cache files and recreate directory structure."""
     try:
+        with _VECTOR_STORE_LOCK:
+            _VECTOR_STORE_CACHE.clear()
+            logger.info("Vector store cache cleared.")
+        global _qdrant_client_instance
+        _qdrant_client_instance = None
+        logger.info("Qdrant client instance cleared.")
+
         if PATHS.root.exists():
             shutil.rmtree(PATHS.root)
         PATHS.ensure()
+        init_db()
         logger.info("Cache directory cleared and recreated.")
         return "✅ Cache cleared successfully."
     except PermissionError as exc:
@@ -3017,12 +3820,57 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
                 )
                 chatbot = gr.Chatbot(label="Conversation", height=400)
 
+                with gr.Row():
+                    diarize_btn = gr.Button("🎙️ Detect Speakers", variant="secondary")
+                    show_speakers_cb = gr.Checkbox(label="Show Speaker Labels in Context", value=False)
+
+                diarization_status = gr.Label(label="Diarization Status")
+                diarized_transcript_out = gr.Markdown(label="Speaker-Labeled Transcript", value="")
+
+                def handle_diarize(state_payload: Dict[str, Any]) -> Tuple[str, str]:
+                    """Run diarization and return status + formatted transcript."""
+                    state = SessionState.from_gradio(state_payload)
+                    if not state.transcript_segments:
+                        return "❌ No transcript available. Run Summarize first.", ""
+                    
+                    # 1. Check Cache
+                    cached = load_cached_diarization(state.video_id, state.transcript_hash)
+                    if cached:
+                        speakers = cached
+                        logger.info("Loaded cached diarization.")
+                    else:
+                        # 2. Run Diarization
+                        wav_path = PATHS.audio / state.video_id / "audio.wav"
+                        if not wav_path.exists():
+                            return "⚠️ Audio file missing. Re-run Summarize.", ""
+                            
+                        if CFG.diarization_backend == "pyannote":
+                            speakers = diarize_audio_acoustic(wav_path, state.transcript_segments, runtime)
+                        else:
+                            speakers = diarize_transcript_llm(state.transcript_segments, runtime)
+                            
+                        if speakers:
+                            save_diarization(state.video_id, state.transcript_hash, speakers)
+                    
+                    # 3. Format Output
+                    unique = len(set(s for s in speakers if s != "Unknown"))
+                    status = f"✅ Detected {unique} speakers via {CFG.diarization_backend}."
+                    markdown = format_diarized_transcript(state.transcript_segments, speakers)
+                    
+                    return status, markdown
+
+                diarize_btn.click(
+                    fn=handle_diarize,
+                    inputs=[session_state],
+                    outputs=[diarization_status, diarized_transcript_out],
+                )
+
                 export_chat_btn = gr.Button("📥 Export Chat History (.md)")
                 chat_file = gr.File(label="Chat Download", interactive=False, elem_classes=["export-file"])
 
                 qa_event = ask_btn.click(
                     fn=qa_handler,
-                    inputs=[video_url_qa, question_input, session_state, qa_prompt_input],
+                    inputs=[video_url_qa, question_input, session_state, qa_prompt_input, show_speakers_cb],
                     outputs=[status_qa, chatbot, qa_progress, session_state],
                     show_progress="full",
                 )

@@ -197,9 +197,9 @@ TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
 # Compiled patterns used by render_clickable_answer.
 # Defined at module level so they are compiled once, not per call.
 # Match grouped citations like [S1, S2, S3] — captures the inner content
-SOURCE_GROUP_PATTERN = re.compile(r"\[((?:S\d+\s*(?:,\s*S\d+\s*)*))\]")
+SOURCE_GROUP_PATTERN = re.compile(r"\[(S\d+(?:\s*,\s*S\d+)*)\]")
 # Match isolated citations like S1 (not inside brackets) — captures the label
-SOURCE_SINGLE_PATTERN = re.compile(r"(?<!\[)(S\d+)(?!\])")
+SOURCE_SINGLE_PATTERN = re.compile(r"(?<!\[)S\d+(?!\])")
 
 # Heavy objects like FAISS/Qdrant stores & BM25 indexes live in process memory.
 _VECTOR_STORE_CACHE: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
@@ -2885,8 +2885,9 @@ def render_clickable_answer(
 
     def _replace_group(match: re.Match) -> str:
         """Replace [S1, S2, S3] with individual inline links."""
-        labels = [lbl.strip() for lbl in match.group(1).split(",")]
-        parts: List[str] = []
+        inner = match.group(1)
+        labels = re.findall(r"S\d+", inner)
+        parts = []
         for lbl in labels:
             ref = source_lookup.get(lbl)
             if ref:
@@ -2898,7 +2899,7 @@ def render_clickable_answer(
 
     def _replace_single(match: re.Match) -> str:
         """Replace an isolated S1 token (already outside brackets) with a link."""
-        lbl = match.group(1)
+        lbl = match.group(0)
         ref = source_lookup.get(lbl)
         if ref:
             used_labels.append(lbl)

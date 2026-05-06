@@ -30,6 +30,7 @@ import tempfile
 import time
 import threading
 from contextlib import contextmanager
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -90,6 +91,43 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+
+class ThreadSafeLRUCache:
+    """Bounded, thread-safe LRU cache for heavy vector stores & BM25 indexes."""
+    def __init__(self, maxsize: int = 16):
+        self._cache = OrderedDict()
+        self._lock = threading.Lock()
+        self._maxsize = maxsize
+
+    def get(self, key) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)  # Update access order
+                return self._cache[key]
+        return None
+
+    def put(self, key, value: Dict[str, Any]) -> None:
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+            self._cache[key] = value
+            # Evict oldest if over capacity
+            if len(self._cache) > self._maxsize:
+                evicted_key, _ = self._cache.popitem(last=False)
+                # Optional: free GPU memory if storing PyTorch objects
+                # if "store" in value: value["store"].cpu() 
+
+    def update_bm25(self, key, bm25_index) -> None:
+        """Atomically update only the BM25 slot for an existing cache entry."""
+        with self._lock:
+            if key in self._cache:
+                self._cache[key]["bm25"] = bm25_index
+                self._cache.move_to_end(key)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._cache.clear()
+
 
 @dataclass(frozen=True)
 class AppConfig:
@@ -194,16 +232,13 @@ PATHS = CachePaths.from_base_dir(CFG.base_dir)
 DB_PATH = PATHS.root / "app_data.db"
 TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
 
-# Compiled patterns used by render_clickable_answer.
+# Compiled pattern used by render_clickable_answer.
 # Defined at module level so they are compiled once, not per call.
-# Match grouped citations like [S1, S2, S3] — captures the inner content
-SOURCE_GROUP_PATTERN = re.compile(r"\[(S\d+(?:\s*,\s*S\d+)*)\]")
-# Match isolated citations like S1 (not inside brackets) — captures the label
-SOURCE_SINGLE_PATTERN = re.compile(r"(?<!\[)S\d+(?!\])")
+# Matches [S1], [S1, S2], [S1][S2], or standalone S1
+CITATION_PATTERN = re.compile(r"\[?\s*(S\s*\d+(?:\s*,\s*S\s*\d+)*)\s*\]?")
 
 # Heavy objects like FAISS/Qdrant stores & BM25 indexes live in process memory.
-_VECTOR_STORE_CACHE: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-_VECTOR_STORE_LOCK = threading.Lock()
+_VECTOR_STORE_CACHE = ThreadSafeLRUCache(maxsize=16) 
 
 
 # =============================================================================
@@ -725,11 +760,11 @@ Final summary:""",
         """Answer the question using ONLY the context.
 
 Rules:
-- If the answer is not in the context, respond exactly:
-  "I don't have enough information to answer this question."
-- When you use evidence, cite supporting sources inline using source ids, for example [S1] or [S1][S2].
-- Do not invent timestamps or sources.
-- Prefer a concise answer.
+1. You MUST cite your sources inline for every claim using source IDs like [S1], [S2], or [S1] [S2].
+2. If the answer is not in the context, respond exactly:
+"I don't have enough information to answer this question."
+3. Do not invent timestamps, facts, or sources.
+4. Keep the answer concise.
 
 Chat History:
 {chat_history}
@@ -739,7 +774,7 @@ Context:
 
 Question: {question}
 
-Answer:""",
+Answer (include [S#] citations for every claim):""",
         ["context", "question", "chat_history"],
     )
 
@@ -1520,11 +1555,10 @@ class SessionState:
         bm25_idx = None
         if video_id and transcript_hash:
             cache_key = (video_id, transcript_hash, CFG.vector_db_type)
-            with _VECTOR_STORE_LOCK:
-                cached = _VECTOR_STORE_CACHE.get(cache_key)
-                if cached:
-                    faiss_idx = cached.get("store")
-                    bm25_idx = cached.get("bm25")
+            cached = _VECTOR_STORE_CACHE.get(cache_key)
+            if cached:
+                faiss_idx = cached.get("store")
+                bm25_idx = cached.get("bm25")
 
         return cls(
             video_url=str(payload.get("video_url", "")),
@@ -1808,11 +1842,11 @@ def get_or_create_vector_store(state: "SessionState", runtime: RuntimeDeps) -> A
     cache_key = (state.video_id, state.transcript_hash, CFG.vector_db_type)
 
     # ── 1. In-memory cache ────────────────────────────────────────────────
-    with _VECTOR_STORE_LOCK:
-        cached = _VECTOR_STORE_CACHE.get(cache_key)
-        if cached and cached.get("store") is not None:
-            logger.info("Vector store cache hit (memory).")
-            return cached["store"]
+    # NO LOCK NEEDED: ThreadSafeLRUCache.get() handles synchronization internally
+    cached = _VECTOR_STORE_CACHE.get(cache_key)
+    if cached and cached.get("store") is not None:
+        logger.info("Vector store cache hit (memory).")
+        return cached["store"]
 
     # ── 2. Ensure chunks.json exists (needed for cross-video BM25) ─────────
     cache_dir = retrieval_record_path(state.video_id, state.transcript_hash)
@@ -1836,9 +1870,7 @@ def get_or_create_vector_store(state: "SessionState", runtime: RuntimeDeps) -> A
     # ── 3. Disk cache ─────────────────────────────────────────────────────
     store = load_vector_store(state.video_id, state.transcript_hash, runtime.embeddings)
     if store is not None:
-        with _VECTOR_STORE_LOCK:
-            _VECTOR_STORE_CACHE[cache_key] = {"store": store, "bm25": None}
-
+        _VECTOR_STORE_CACHE.put(cache_key, {"store": store, "bm25": None})
         logger.info("Vector store loaded from disk cache.")
         return store
 
@@ -1876,10 +1908,8 @@ def get_or_create_vector_store(state: "SessionState", runtime: RuntimeDeps) -> A
         else:
             logger.warning("Qdrant collection missing after build: %s", collection_name)
 
-    # ── 6. Store in memory cache ──────────────────────────────────────────
-    with _VECTOR_STORE_LOCK:
-        _VECTOR_STORE_CACHE[cache_key] = {"store": store, "bm25": None}
-
+    # ── 6. Store in memory cache ──────────────────────────────────────────  
+    _VECTOR_STORE_CACHE.put(cache_key, {"store": store, "bm25": None})
     logger.info("Vector store built and cached in memory.")
     return store
 
@@ -2870,26 +2900,18 @@ def render_clickable_answer(
     raw_answer: str, source_lookup: Dict[str, "SourceRef"]
 ) -> str:
     """Replace [S1]-style LLM citations with clickable Markdown timestamp links.
-
-    The LLM may cite sources in two patterns:
-        Grouped  — [S1, S2, S3]   matched by SOURCE_GROUP_PATTERN
-        Isolated — [S1]           matched by SOURCE_SINGLE_PATTERN
-
-    Both are replaced with inline Markdown links that open the YouTube video at
-    the correct timestamp.  A deduplicated **References** section is appended
-    listing every source the LLM actually cited.
-
-    Deduplication uses dict.fromkeys for O(n) order-preserving uniqueness —
-    faster than the O(n²) "if x not in seen" pattern for long answers.
+    Handles [S1], [S1, S2], [S1][S2], and bare S1 formats robustly.
     """
-
-    rendered = raw_answer
     used_labels: List[str] = []
+    rendered = raw_answer
 
-    def _replace_group(match: re.Match) -> str:
-        """Replace [S1, S2, S3] with individual inline links."""
-        inner = match.group(1)
-        labels = re.findall(r"S\d+", inner)
+    def _replace(match: re.Match) -> str:
+        text = match.group(0)
+        # Extract all S1, S2, etc. tokens, stripping optional spaces
+        labels = [lbl.strip() for lbl in re.findall(r"S\s*\d+", text)]
+        if not labels:
+            return text
+
         parts = []
         for lbl in labels:
             ref = source_lookup.get(lbl)
@@ -2900,34 +2922,29 @@ def render_clickable_answer(
                 parts.append(f"[{lbl}]")
         return " ".join(parts)
 
-    def _replace_single(match: re.Match) -> str:
-        """Replace an isolated S1 token (already outside brackets) with a link."""
-        lbl = match.group(0)
-        ref = source_lookup.get(lbl)
-        if ref:
-            used_labels.append(lbl)
-            return f"[{ref.label}]({ref.url})"
-        return lbl
+    # 1. Process citations (Uses CITATION_PATTERN defined at module level)
+    rendered = CITATION_PATTERN.sub(_replace, rendered)
 
-    # Process grouped citations first so SOURCE_SINGLE_PATTERN doesn't
-    # partially match inside a group like [S1, S2].
-    rendered = SOURCE_GROUP_PATTERN.sub(_replace_group, rendered)
-    rendered = SOURCE_SINGLE_PATTERN.sub(_replace_single, rendered)
+    # 2. Fix Markdown rendering quirks
+    # Markdown [Link1](url)[Link2](url) renders as "Link1Link2".
+    # We must target the boundary "][" between the closing paren of URL and opening bracket of next link.
+    # Regex r'\)\[' matches "][" and replaces it with ") [".
+    rendered = re.sub(r'\)\[', ') [', rendered)
 
-    # Append a deduplicated References section for every cited source.
-    seen = dict.fromkeys(used_labels)  # preserves first-seen order, O(n)
-    cited_refs = [
-        (lbl, source_lookup[lbl])
-        for lbl in seen
-        if lbl in source_lookup
-    ]
+    # 3. Cleanup
+    rendered = re.sub(r'  +', ' ', rendered)  # Normalize double spaces
+    rendered = re.sub(r' (\.\.\.?|,|;|:|!|\?)', r'\1', rendered)  # Trim space before punctuation
 
+    # 4. Append deduplicated References section
+    seen = dict.fromkeys(used_labels)
+    cited_refs = [(lbl, source_lookup[lbl]) for lbl in seen if lbl in source_lookup]
+    
     if cited_refs:
         ref_lines = ["\n\n**References**"]
         for lbl, ref in cited_refs:
             ref_lines.append(f"- [{ref.label}]({ref.url})")
         rendered += "\n".join(ref_lines)
-
+        
     return rendered
 
 # =============================================================================
@@ -3353,11 +3370,9 @@ def _make_qa_handler(runtime: RuntimeDeps):
                 )
                 state.bm25_index = updated_bm25  # Persist in state
 
-                # Sync back to global cache using your existing lock
+                # Sync BM25 back to memory cache (thread-safe)
                 cache_key = (state.video_id, state.transcript_hash, CFG.vector_db_type)
-                with _VECTOR_STORE_LOCK:
-                    if cache_key in _VECTOR_STORE_CACHE:
-                        _VECTOR_STORE_CACHE[cache_key]["bm25"] = updated_bm25
+                _VECTOR_STORE_CACHE.update_bm25(cache_key, updated_bm25)
 
             if not docs:
                 state.chat_history.append({"role": "user", "content": question})
@@ -3582,9 +3597,8 @@ def get_cache_stats() -> str:
 def clear_cache() -> str:
     """Safely delete all cache files and recreate directory structure."""
     try:
-        with _VECTOR_STORE_LOCK:
-            _VECTOR_STORE_CACHE.clear()
-            logger.info("Vector store cache cleared.")
+        _VECTOR_STORE_CACHE.clear()
+        logger.info("Vector store cache cleared.")
         global _qdrant_client_instance
         _qdrant_client_instance = None
         logger.info("Qdrant client instance cleared.")

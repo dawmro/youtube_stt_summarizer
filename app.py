@@ -3105,6 +3105,9 @@ def _make_summarize_handler(runtime: RuntimeDeps):
             (status, token_info, transcript, summary, stats,
              stt_progress, summary_progress, state)
         """
+        # Initialize fallbacks early
+        token_info = ""
+        stats_info = ""
         state = SessionState.from_gradio(state_payload)
         state.summary_prompt_override = summary_prompt_override.strip()
         started_at = time.perf_counter()

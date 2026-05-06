@@ -1,69 +1,86 @@
 """
-conftest.py — stubs all heavy dependencies before the app module is imported.
-Run tests with:
-    pytest -v
-Place conftest.py in the same directory as app.py and test_api.py.
+conftest.py — stubs all heavy dependencies before app/api modules are imported.
+Run tests with: pytest -v
 Every stub is installed into sys.modules inside pytest_configure, which runs
-before any test module is collected or imported. This guarantees that when
-test_api.py does `import app`, the heavy libraries are 
-already replaced by lightweight in-memory fakes.
+before any test module is collected. This guarantees zero GPU, Ollama, or
+network requirements during unit tests.
 """
 import sys
 import types
 from unittest.mock import MagicMock
 
 def _stub(name: str) -> types.ModuleType:
-    """Create an empty module, register it in sys.modules, and return it."""
     m = types.ModuleType(name)
     sys.modules[name] = m
     return m
 
-def pytest_configure(config):  # noqa: ARG001
-    # Register custom markers to suppress PytestUnknownMarkWarning
+def pytest_configure(config):
+    # Register custom markers to suppress warnings
     config.addinivalue_line(
         "markers", "integration: marks tests requiring real Ollama/Whisper models"
     )
+
     # ---- gradio ----------------------------------------------------------------
     gr = _stub("gradio")
     ctx = MagicMock()
     ctx.__enter__ = MagicMock(return_value=MagicMock())
     ctx.__exit__ = MagicMock(return_value=False)
     gr.Blocks = MagicMock(return_value=ctx)
-    for attr in ["State", "Row", "Column", "Textbox", "Button",
-                 "Slider", "Markdown", "Tabs", "TabItem", "Label", "Chatbot", "File", "Accordion", "HTML"]:
+    for attr in ["State", "Row", "Column", "Textbox", "Button", "Slider",
+                 "Markdown", "Tabs", "TabItem", "Label", "Chatbot", "File",
+                 "Accordion", "HTML", "Dataframe", "CheckboxGroup"]:
         setattr(gr, attr, MagicMock())
 
     # ---- faster_whisper --------------------------------------------------------
     fw = _stub("faster_whisper")
     fw.WhisperModel = MagicMock()
 
-    # ---- langchain family ------------------------------------------------------
-    for mod_name in [
-        "langchain", "langchain.chains", "langchain.prompts", "langchain.text_splitter",
-        "langchain_community", "langchain_community.embeddings", "langchain_community.llms",
-        "langchain_community.vectorstores", "langchain_qdrant",
-    ]:
-        _stub(mod_name)
+    # ---- langchain 0.3.x family ------------------------------------------------
+    _stub("langchain_ollama")
+    sys.modules["langchain_ollama"].ChatOllama = MagicMock()
+    sys.modules["langchain_ollama"].OllamaEmbeddings = MagicMock()
 
-    sys.modules["langchain.chains"].LLMChain = MagicMock()
-    sys.modules["langchain.prompts"].PromptTemplate = MagicMock()
-    sys.modules["langchain.text_splitter"].RecursiveCharacterTextSplitter = MagicMock()
-    sys.modules["langchain_community.embeddings"].OllamaEmbeddings = MagicMock()
-    sys.modules["langchain_community.llms"].Ollama = MagicMock()
+    _stub("langchain_core")
+    _stub("langchain_core.prompts")
+    sys.modules["langchain_core.prompts"].PromptTemplate = MagicMock()
+    _stub("langchain_core.runnables")
+    sys.modules["langchain_core.runnables"].RunnableSequence = MagicMock()
+    _stub("langchain_core.messages")
+    sys.modules["langchain_core.messages"].AIMessage = MagicMock()
+
+    _stub("langchain_text_splitters")
+    sys.modules["langchain_text_splitters"].RecursiveCharacterTextSplitter = MagicMock()
+
+    _stub("langchain_community")
+    _stub("langchain_community.vectorstores")
     sys.modules["langchain_community.vectorstores"].FAISS = MagicMock()
-    sys.modules["langchain_qdrant"].Qdrant = MagicMock()
-    sys.modules["langchain_qdrant"].QdrantVectorStore = MagicMock()
 
     # ---- qdrant & bm25 ---------------------------------------------------------
-    qc = _stub("qdrant_client")
-    qc.QdrantClient = MagicMock()
-    qc.models = MagicMock()
-    qc.models.VectorParams = MagicMock()
-    qc.models.Distance = MagicMock()
+    _stub("langchain_qdrant")
+    sys.modules["langchain_qdrant"].Qdrant = MagicMock()
+    sys.modules["langchain_qdrant"].QdrantVectorStore = MagicMock()
+    _stub("qdrant_client")
+    sys.modules["qdrant_client"].QdrantClient = MagicMock()
+    _stub("qdrant_client.models")
+    sys.modules["qdrant_client.models"].VectorParams = MagicMock()
+    sys.modules["qdrant_client.models"].Distance = MagicMock()
     _stub("rank_bm25")
     sys.modules["rank_bm25"].BM25Okapi = MagicMock()
 
-    # ---- requests: make ensure_ollama_ready() pass at import time --------------
+    # ---- pyannote & torch ------------------------------------------------------
+    _stub("pyannote")
+    _stub("pyannote.audio")
+    sys.modules["pyannote.audio"].Pipeline = MagicMock()
+    _stub("torch")
+    sys.modules["torch"].device = MagicMock()
+    sys.modules["torch"].cuda = MagicMock()
+    sys.modules["torch"].cuda.is_available = MagicMock(return_value=False)
+
+    # ---- dotenv ----------------------------------------------------------------
+    _stub("dotenv")
+    sys.modules["dotenv"].load_dotenv = MagicMock()
+
+    # ---- requests: mock Ollama health check ------------------------------------
     req = _stub("requests")
     mock_resp = MagicMock()
     mock_resp.raise_for_status = MagicMock()

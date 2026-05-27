@@ -195,7 +195,7 @@ async def summarize(req: SummarizeRequest):
 
 
 @app.post("/qa", response_model=QAResponse)
-async def qa(req: QARequest):
+def qa(req: QARequest): # sync def → runs in Starlette threadpool automatically
     """Stateless timestamp-aware Q&A with hybrid retrieval and citation rendering."""
     if not runtime:
         raise HTTPException(503, "Runtime not initialized")

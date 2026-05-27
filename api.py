@@ -218,7 +218,7 @@ async def qa(req: QARequest):
         vector_store = get_or_create_vector_store(state, runtime)
 
         # Hybrid dense + BM25 retrieval
-        docs = hybrid_search(
+        docs, _ = hybrid_search(
             question=req.question,
             vector_store=vector_store,
             chunks=state.chunks,

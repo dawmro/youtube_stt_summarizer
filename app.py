@@ -163,11 +163,11 @@ class AppConfig:
     semantic_chunk_max_chars: int = 1200        # hard cap to prevent oversized embeddings
 
     # Hybrid search tuning parameters
-    hybrid_dense_weight: float = 0.7       # 0.0 = pure BM25, 1.0 = pure FAISS
+    hybrid_dense_weight: float = 0.7       # 0.0 = pure BM25, 1.0 = pure dense
     hybrid_top_k_candidates: int = 8       # fetch more candidates before fusion
     retrieval_top_k: int = 4
 
-    # Vector store: Qdrant only (FAISS support removed)
+    # Vector store: Qdrant 
     qdrant_path: str = "cache/qdrant_db"  # local persistence path
 
     whisper_model_size: str = "large-v3"   # "small", "medium", "large-v3"
@@ -247,7 +247,7 @@ TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
 # Matches [S1], [S1, S2], [S1][S2], or standalone S1
 CITATION_PATTERN = re.compile(r"\[?\s*(S\s*\d+(?:\s*,\s*S\s*\d+)*)\s*\]?")
 
-# Heavy objects like FAISS/Qdrant stores & BM25 indexes live in process memory.
+# Heavy objects like Qdrant stores & BM25 indexes live in process memory.
 _VECTOR_STORE_CACHE = ThreadSafeLRUCache(maxsize=16) 
 
 
@@ -1556,9 +1556,9 @@ class SessionState:
         from_dict() class methods; entries that are not dicts are silently
         skipped so a single corrupted record does not destroy the whole session.
 
-        Heavy vector store objects are reattached from the global _VECTOR_STORE_CACHE
+        Heavy BM25 index is reattached from the global _VECTOR_STORE_CACHE
         using (video_id, transcript_hash) as the lookup key. Qdrant collections
-        are server-side persisted; no local FAISS files are involved.
+        are server-side persisted and loaded on demand.
         """
         if not payload:
             return cls()
@@ -1566,17 +1566,16 @@ class SessionState:
         raw_segments = payload.get("transcript_segments") or []
         raw_chunks = payload.get("chunks")
 
-        # Reattach heavy objects from global cache if available
+        # Reattach BM25 index from global cache if available
         video_id = str(payload.get("video_id", ""))
         transcript_hash = str(payload.get("transcript_hash", ""))
-        store_idx = None
         bm25_idx = None
+        
         if video_id and transcript_hash:
             # Qdrant-only cache key: no vector_db_type component
             cache_key = (video_id, transcript_hash)
             cached = _VECTOR_STORE_CACHE.get(cache_key)
             if cached:
-                store_idx = cached.get("store")
                 bm25_idx = cached.get("bm25")
 
         return cls(
@@ -1718,7 +1717,7 @@ def build_vector_store(
     embeddings: OllamaEmbeddings,
     video_id: str,
 ) -> Any:
-    """Build Qdrant collection and upsert vectors. FAISS support removed."""
+    """Build Qdrant collection and upsert vectors."""
     if not QDRANT_AVAILABLE:
         raise ImportError("Install qdrant-client and langchain-qdrant for Qdrant support.")
 
@@ -1756,7 +1755,7 @@ def load_vector_store(
     transcript_hash: str,
     embeddings: OllamaEmbeddings,
 ) -> Optional[Any]:
-    """Load Qdrant collection if available. FAISS fallback removed."""
+    """Load Qdrant collection if available."""
     if not QDRANT_AVAILABLE:
         logger.warning("Qdrant requested but qdrant dependencies are unavailable.")
         return None
@@ -1779,7 +1778,6 @@ def load_vector_store(
     except Exception as e:
         logger.warning("Failed to load Qdrant collection for %s: %s", video_id, e)
         return None
-
 
 
 def get_or_create_vector_store(state: "SessionState", runtime: RuntimeDeps) -> Any:
@@ -1976,7 +1974,7 @@ def hybrid_search(
         )
 
         if max_s > min_s:
-            # Cosine similarity: higher is better, normalize directly via min-max.
+            # Qdrant cosine similarity: higher is better, normalize directly via min-max.
             norm_dense = [(s - min_s) / (max_s - min_s) for s in dense_scores]
         else:
             # All dense scores are equal -> treat them as equally relevant.
@@ -2310,7 +2308,7 @@ def cross_video_hybrid_search(
             # Qdrant uses cosine similarity (higher is better, typically [0, 1]).
             norm_scores: List[float] = []
             if max_s > min_s:
-                # Cosine similarity: higher is better, normalize directly via min-max.
+                # Qdrant cosine similarity: higher is better, normalize directly via min-max.
                 norm_scores = [(s - min_s) / (max_s - min_s) for s in raw_scores]
             else:
                 # All dense scores are equal -> treat them as equally relevant.
@@ -3219,7 +3217,7 @@ def _make_qa_handler(runtime: RuntimeDeps):
         Streams four outputs: (status, answer, progress, state).
         Skips transcript fetch if the session already has it cached.
 
-        Vector store operations use Qdrant exclusively; no FAISS files involved.
+        Vector store operations use Qdrant exclusively.
         """
         state = SessionState.from_gradio(state_payload)
         state.qa_prompt_override = qa_prompt_override.strip()
@@ -3494,10 +3492,8 @@ def handle_export_chat(state_payload: Dict[str, Any]) -> Optional[str]:
     return path
 
 def handle_export_session_json(state_payload: Dict[str, Any]) -> Optional[str]:
-    safe_payload = dict(state_payload)
-    safe_payload.pop("faiss_index", None)
     path = _create_temp_file(
-        json.dumps(safe_payload, indent=2, ensure_ascii=False),
+        json.dumps(state_payload, indent=2, ensure_ascii=False),
         "session_export.json"
     )
     logger.info("Exporting session JSON → %s", path)
@@ -3882,7 +3878,6 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
                     """Batch-index selected videos with full observability.
 
                     Qdrant-only: collections are created/checked via singleton client.
-                    No FAISS index files are written or read.
                     """
                     if not selected_videos:
                         yield "❌ No videos selected."

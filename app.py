@@ -92,7 +92,17 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 class ThreadSafeLRUCache:
-    """Bounded, thread-safe LRU cache for heavy vector stores & BM25 indexes."""
+    """Bounded, thread-safe LRU cache for heavy vector stores & BM25 indexes.
+    
+    Design:
+    - Stores QdrantVectorStore instances under (video_id, transcript_hash) keys.
+    - BM25 indexes are stored alongside for hybrid search fusion.
+    - Thread-safe via internal threading.Lock; safe for Gradio's async/thread pool.
+    - Max size limits memory growth; oldest entries evicted on overflow.
+    
+    Note: Qdrant collections persist server-side; this cache only holds
+    in-memory Python references for fast reuse within the process lifetime.
+    """
     def __init__(self, maxsize: int = 16):
         self._cache = OrderedDict()
         self._lock = threading.Lock()
@@ -1390,7 +1400,6 @@ class SourceRef:
 @dataclass
 class SessionState:
     """Per-user in-memory session holding the active transcript and derived state.
-
     All fields default to safe empty values so a freshly constructed instance
     represents the "nothing loaded yet" state without any conditional checks.
 
@@ -1404,12 +1413,16 @@ class SessionState:
                                start/end timestamps and optional word timings.
 
     Derived fields (cleared by reset_derived when a new transcript is loaded):
-        summary       — the most recently generated summary text.
-        chat_history  — List[Dict[str, str]] conversation history
-        chunks        — List[RetrievalChunk] built from transcript_segments.
-        faiss_index   — FAISS vector store built from chunks.
-        summary_prompt_override - Summary prompt override.
-        qa_prompt_override - Question and answer prompt override.
+        summary              — the most recently generated summary text.
+        chat_history         — List[Dict[str, str]] conversation history
+        chunks               — List[RetrievalChunk] built from transcript_segments.
+        bm25_index           — BM25 lexical index for hybrid search (kept in _VECTOR_STORE_CACHE).
+        summary_prompt_override — Custom prompt for summarization.
+        qa_prompt_override   — Custom prompt for Q&A.
+
+    Note: Vector stores (Qdrant collections) are managed server-side and referenced
+    via the global _VECTOR_STORE_CACHE using (video_id, transcript_hash) as the key.
+    No local FAISS index files are involved.
     """
     # --- transcript fields ---
     video_url: str = ""
@@ -1423,7 +1436,6 @@ class SessionState:
     # Gradio's chatbot component natively serializes history as lists of lists
     chat_history: List[Dict[str, str]] = field(default_factory=list)
     chunks: Optional[List[RetrievalChunk]] = None
-    faiss_index: Optional[Any] = None
     summary_prompt_override: str = ""
     qa_prompt_override: str = ""
     bm25_index: Optional[Any] = None
@@ -1438,11 +1450,13 @@ class SessionState:
         Called by set_transcript whenever a new video is loaded so that the
         summary, Q&A history, and retrieval index from the previous session are
         never accidentally served for a different video.
+
+        Note: Qdrant collections are server-side persisted; only the in-memory
+        cache reference in _VECTOR_STORE_CACHE is cleared, not the collection itself.
         """
         self.summary = ""
         self.chat_history = []
         self.chunks = None
-        self.faiss_index = None
         self.bm25_index = None
 
     def set_transcript(
@@ -1504,8 +1518,7 @@ class SessionState:
         (QdrantVectorStore) are kept in the process-level _VECTOR_STORE_CACHE
         and referenced by cache key — never serialised into Gradio state.
 
-        Note: faiss_index field is retained for backward compatibility during
-        the migration but always emitted as None. Qdrant collections are
+        Note: No faiss_index field is emitted. Qdrant collections are
         server-side persisted and accessed via singleton client.
         """
         return {
@@ -1521,8 +1534,6 @@ class SessionState:
                 if self.chunks is not None
                 else None
             ),
-            # Legacy field — always None. Qdrant stores are cached in _VECTOR_STORE_CACHE.
-            "faiss_index": None,
             "bm25_index": None,   # Kept in _VECTOR_STORE_CACHE
             "summary_prompt_override": self.summary_prompt_override,
             "qa_prompt_override": self.qa_prompt_override,
@@ -1584,8 +1595,6 @@ class SessionState:
                 if isinstance(raw_chunks, list)
                 else None
             ),
-            # Legacy field — always None. Qdrant stores are cached in _VECTOR_STORE_CACHE.
-            faiss_index=None,
             bm25_index=bm25_idx,
             summary_prompt_override=str(payload.get("summary_prompt_override", "")),
             qa_prompt_override=str(payload.get("qa_prompt_override", "")),

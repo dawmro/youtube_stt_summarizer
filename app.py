@@ -48,7 +48,6 @@ from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnableSequence
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
 
 from faster_whisper import WhisperModel
 
@@ -1255,11 +1254,10 @@ def load_cached_summary(
 
 @dataclass
 class RetrievalChunk:
-    """Retrieval unit stored in cache and indexed into FAISS.
-
+    """Retrieval unit stored in cache and indexed into Qdrant.
     Each chunk covers a contiguous window of TranscriptSegment objects.
     segment_ids records which segments are included so source timestamps can
-    be recovered after a FAISS similarity search without re-scanning the full
+    be recovered after a Qdrant similarity search without re-scanning the full
     transcript.
     """
     chunk_id: int
@@ -1594,53 +1592,35 @@ class SessionState:
         )
 
 # =============================================================================
-# RETRIEVAL CACHE  (chunks JSON + FAISS index on disk)
+# RETRIEVAL CACHE  (chunks JSON only — Qdrant persists vectors server-side)
 # =============================================================================
 
 def retrieval_record_path(video_id: str, transcript_hash_value: str) -> Path:
-    """Derive the cache directory for retrieval artifacts.
+    """Derive the cache directory for retrieval metadata.
 
     Pattern: retrieval/<video_id>__<retrieval_config_hash>__<transcript_hash>/
     Both the embedding model settings and the transcript content are encoded
     so either change automatically routes to a fresh build.
+
+    Note: This directory stores only chunks.json for cross-video BM25 operations.
+    Qdrant collections are persisted server-side at CFG.qdrant_path; no local
+    binary index files are written or read.
     """
     folder_name = f"{video_id}__{RETRIEVAL_CONFIG_HASH}__{transcript_hash_value}"
     return PATHS.retrieval / folder_name
 
 
-def save_retrieval_cache(
-    video_id: str,
-    transcript_hash_value: str,
-    chunks: List[RetrievalChunk],
-    faiss_index: FAISS,
-) -> None:
-    """Persist RetrievalChunk list as JSON and FAISS index files to disk."""
-    cache_dir = retrieval_record_path(video_id, transcript_hash_value)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    # Chunk metadata (JSON) — human-readable, used to restore state.chunks.
-    write_json_atomic(
-        cache_dir / "chunks.json",
-        {
-            "video_id": video_id,
-            "transcript_hash": transcript_hash_value,
-            "chunks": [chunk.to_dict() for chunk in chunks],
-            "retrieval_config_hash": RETRIEVAL_CONFIG_HASH,
-            "retrieval_config": current_retrieval_config(),
-            "saved_at": time.time(),
-        },
-    )
-
-    # FAISS index — two binary files (index.faiss + index.pkl) written by
-    # LangChain's save_local helper.
-    faiss_index.save_local(str(cache_dir))
-    logger.info(
-        "Retrieval cache saved (%d chunks) → %s", len(chunks), cache_dir
-    )
-
-
 def load_cached_chunks(video_id: str, transcript_hash: str) -> Optional[List[RetrievalChunk]]:
-    """Load only retrieval chunks from disk without touching FAISS/Qdrant."""
+    """Load only retrieval chunks from disk without touching vector stores.
+
+    Qdrant collections are checked via load_vector_store(); this function
+    only reads the human-readable chunks.json metadata used for:
+    - Cross-video BM25 index construction
+    - Session state reconstruction from Gradio payload
+    - Cache validation and observability
+
+    Returns None on missing file or corrupted JSON.
+    """
     cache_dir = retrieval_record_path(video_id, transcript_hash)
     chunks_path = cache_dir / "chunks.json"
 
@@ -1658,21 +1638,18 @@ def load_cached_chunks(video_id: str, transcript_hash: str) -> Optional[List[Ret
         return None
 
 
-def load_retrieval_cache(
-    video_id: str,
-    transcript_hash_value: str,
-    embeddings: OllamaEmbeddings,
-) -> Optional[Tuple[List[RetrievalChunk], Any]]:
-    """Legacy function kept for compatibility. Qdrant uses server-side persistence."""
-    # Qdrant collections are checked via load_vector_store(); no local FAISS files to load.
-    return None
-
-
 def get_or_create_chunks(state: SessionState, runtime: RuntimeDeps) -> None:
     """Populate state.chunks from cache or by building from transcript segments.
 
-    Mutates state in place.  A no-op when state.chunks is already set (e.g.
-    the FAISS index was rebuilt from the disk cache in get_or_create_faiss).
+    Mutates state in place. A no-op when state.chunks is already set.
+
+    Strategy:
+    1. Check disk cache for chunks.json (fast path for repeat runs)
+    2. If miss, build chunks via semantic embedding similarity
+    3. Persist chunks.json for future cache hits
+
+    Note: Vector store persistence is handled by Qdrant server-side;
+    this function only manages the chunk metadata layer.
     """
     if state.chunks is not None:
         return
@@ -1800,7 +1777,7 @@ def get_or_create_vector_store(state: "SessionState", runtime: RuntimeDeps) -> A
     - always ensures chunks.json exists for BM25 cross-video search
 
     Qdrant collections are persisted server-side at CFG.qdrant_path.
-    No local FAISS index files are created or loaded.
+    No local index files are created or loaded.
     """
     if not state.video_id or not state.transcript_hash:
         raise ValueError("Session missing video_id or transcript_hash.")

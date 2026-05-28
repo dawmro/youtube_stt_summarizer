@@ -1,14 +1,13 @@
 
 """
 [WIP] YouTube STT Summarizer & Timestamp-Aware Q&A Tool
-
 Business goal:
-- Download audio from a YouTube video.
-- Transcribe it locally with faster-whisper. 
-- Cache transcript and retrieval artifacts so repeated runs stay fast.
-- Summarize the transcript with Ollama.
-- Answer questions from the transcript with FAISS retrieval.
-- Render clickable YouTube timestamp links in Q&A answers.
+Download audio from a YouTube video.
+Transcribe it locally with faster-whisper.
+Cache transcript and retrieval artifacts so repeated runs stay fast.
+Summarize the transcript with Ollama.
+Answer questions from the transcript with Qdrant retrieval.
+Render clickable YouTube timestamp links in Q&A answers.
 """
 
 import os
@@ -149,7 +148,7 @@ class AppConfig:
     """
 
     base_dir: Path = Path(__file__).resolve().parent
-    llm_model: str = "llama3.2:3b" # "llama3.1:8b-instruct-q8_0"
+    llm_model: str = "llama3.1:8b-instruct-q8_0"
     embedding_model: str = "mxbai-embed-large" # "nomic-embed-text" or "mxbai-embed-large"
     ollama_base_url: str = "http://localhost:11434"
 
@@ -162,14 +161,16 @@ class AppConfig:
     # Character-based limit for semantic chunking parameters
     semantic_chunk_threshold: float = 0.75      # cosine similarity merge threshold
     semantic_chunk_max_chars: int = 1200        # hard cap to prevent oversized embeddings
+
     # Hybrid search tuning parameters
     hybrid_dense_weight: float = 0.7       # 0.0 = pure BM25, 1.0 = pure FAISS
     hybrid_top_k_candidates: int = 8       # fetch more candidates before fusion
     retrieval_top_k: int = 4
-    vector_db_type: str = "qdrant"  # "qdrant" or "faiss"
+
+    # Vector store: Qdrant only (FAISS support removed)
     qdrant_path: str = "cache/qdrant_db"  # local persistence path
 
-    whisper_model_size: str = "medium"   # "small", "medium", "large-v3"
+    whisper_model_size: str = "large-v3"   # "small", "medium", "large-v3"
     whisper_device: str = "cpu"         # "cpu" or "cuda"
     whisper_compute_type: str = "int8"  # "int8" or "float16"
     whisper_language: Optional[str] = None
@@ -384,6 +385,10 @@ def current_summary_config() -> Dict[str, Any]:
 
 
 def current_retrieval_config() -> Dict[str, Any]:
+    """Return config snapshot for retrieval cache key generation.
+    
+    Qdrant-only: no vector_db_type toggle included.
+    """
     return {
         "embedding_model": CFG.embedding_model,
         "semantic_chunk_threshold": CFG.semantic_chunk_threshold,

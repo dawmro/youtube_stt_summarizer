@@ -113,7 +113,7 @@ def health():
     return HealthResponse(
         status="ok",
         models_loaded=True,
-        vector_db=CFG.vector_db_type,
+        vector_db="qdrant",  # Qdrant-only: hardcoded value
         whisper_model=CFG.whisper_model_size,
         llm_model=CFG.llm_model,
     )

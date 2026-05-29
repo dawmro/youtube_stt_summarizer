@@ -1424,6 +1424,7 @@ class SessionState:
         bm25_index           — BM25 lexical index for hybrid search (kept in _VECTOR_STORE_CACHE).
         summary_prompt_override — Custom prompt for summarization.
         qa_prompt_override   — Custom prompt for Q&A.
+        use_speaker_labels   - Auto-enabled when "Detect Speakers" button is clicked
 
     Note: Vector stores (Qdrant collections) are managed server-side and referenced
     via the global _VECTOR_STORE_CACHE using (video_id, transcript_hash) as the key.
@@ -1444,6 +1445,7 @@ class SessionState:
     summary_prompt_override: str = ""
     qa_prompt_override: str = ""
     bm25_index: Optional[Any] = None
+    use_speaker_labels: bool = False
 
     # ------------------------------------------------------------------ #
     # Mutation helpers                                                     #
@@ -1542,6 +1544,7 @@ class SessionState:
             "bm25_index": None,   # Kept in _VECTOR_STORE_CACHE
             "summary_prompt_override": self.summary_prompt_override,
             "qa_prompt_override": self.qa_prompt_override,
+            "use_speaker_labels": self.use_speaker_labels,
         }
 
     @classmethod
@@ -1602,6 +1605,7 @@ class SessionState:
             bm25_index=bm25_idx,
             summary_prompt_override=str(payload.get("summary_prompt_override", "")),
             qa_prompt_override=str(payload.get("qa_prompt_override", "")),
+            use_speaker_labels=bool(payload.get("use_speaker_labels", False)),
         )
 
 # =============================================================================
@@ -3206,7 +3210,6 @@ def _make_qa_handler(runtime: RuntimeDeps):
         user_question: str,
         state_payload: Dict[str, Any],
         qa_prompt_override: str,
-        show_speakers: bool = False,
     ) -> Generator:
         """Run timestamp-aware transcript Q&A and stream UI updates.
 
@@ -3308,10 +3311,11 @@ def _make_qa_handler(runtime: RuntimeDeps):
                 yield "✅ Answer ready.", state.chat_history, 100, state.to_gradio()
                 return
             
-            # Load speaker labels if toggle is active
+            # Use speaker labels if enabled via "Detect Speakers" button
             speakers = None
-            if show_speakers:
+            if state.use_speaker_labels:
                 speakers = load_cached_diarization(state.video_id, state.transcript_hash)
+                # If flag is set but cache is missing/empty, speakers remains None -> safe fallback
 
             context, source_lookup = build_context_with_sources(docs, state.video_id, speakers=speakers)
             # logger.info("CONTEXT PREVIEW:\n%s", context[:1500])
@@ -3777,7 +3781,6 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
 
                 with gr.Row():
                     diarize_btn = gr.Button("🎙️ Detect Speakers", variant="secondary")
-                    show_speakers_cb = gr.Checkbox(label="Show Speaker Labels in Context", value=False)
 
                 diarization_status = gr.Label(label="Diarization Status")
                 diarized_transcript_out = gr.Markdown(label="Speaker-Labeled Transcript", value="")
@@ -3787,37 +3790,47 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
                     state = SessionState.from_gradio(state_payload)
                     if not state.transcript_segments:
                         return "❌ No transcript available. Run Summarize first.", ""
+
+                    speakers = None
+                    status = ""
                     
                     # 1. Check Cache
                     cached = load_cached_diarization(state.video_id, state.transcript_hash)
                     if cached:
                         speakers = cached
                         logger.info("Loaded cached diarization.")
+                        status = f"✅ Loaded cached diarization ({len(set(s for s in speakers if s != 'Unknown'))} speakers)."
+                        state.use_speaker_labels = True  # Enable for future QA
                     else:
                         # 2. Run Diarization
                         wav_path = PATHS.audio / state.video_id / "audio.wav"
                         if not wav_path.exists():
-                            return "⚠️ Audio file missing. Re-run Summarize.", ""
+                            return "⚠️ Audio file missing. Re-run Summarize.", "", state_payload
+                        try:               
+                            if CFG.diarization_backend == "pyannote":
+                                speakers = diarize_audio_acoustic(wav_path, state.transcript_segments, runtime)
+                            else:
+                                speakers = diarize_transcript_llm(state.transcript_segments, runtime)
                             
-                        if CFG.diarization_backend == "pyannote":
-                            speakers = diarize_audio_acoustic(wav_path, state.transcript_segments, runtime)
-                        else:
-                            speakers = diarize_transcript_llm(state.transcript_segments, runtime)
-                            
-                        if speakers:
-                            save_diarization(state.video_id, state.transcript_hash, speakers)
+                            if speakers:
+                                save_diarization(state.video_id, state.transcript_hash, speakers)
+                                unique = len(set(s for s in speakers if s != "Unknown"))
+                                status = f"✅ Detected {unique} speakers via {CFG.diarization_backend}."
+                                state.use_speaker_labels = True  # Enable for future QA
+                            else:
+                                status = "⚠️ Diarization returned empty results."
                     
-                    # 3. Format Output
-                    unique = len(set(s for s in speakers if s != "Unknown"))
-                    status = f"✅ Detected {unique} speakers via {CFG.diarization_backend}."
-                    markdown = format_diarized_transcript(state.transcript_segments, speakers)
-                    
-                    return status, markdown
+                        except Exception as exc:
+                            logger.exception("Diarization failed")
+                            status = f"❌ Diarization failed: {exc}"
+
+                    markdown = format_diarized_transcript(state.transcript_segments, speakers or [])
+                    return status, markdown, state.to_gradio()
 
                 diarize_btn.click(
                     fn=handle_diarize,
                     inputs=[session_state],
-                    outputs=[diarization_status, diarized_transcript_out],
+                    outputs=[diarization_status, diarized_transcript_out, session_state],
                 )
 
                 export_chat_btn = gr.Button("📥 Export Chat History (.md)")
@@ -3825,7 +3838,7 @@ def build_interface(runtime: RuntimeDeps) -> gr.Blocks:
 
                 qa_event = ask_btn.click(
                     fn=qa_handler,
-                    inputs=[video_url_qa, question_input, session_state, qa_prompt_input, show_speakers_cb],
+                    inputs=[video_url_qa, question_input, session_state, qa_prompt_input],
                     outputs=[status_qa, chatbot, qa_progress, session_state],
                     show_progress="full",
                 )
